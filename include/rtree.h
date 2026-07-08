@@ -13,9 +13,10 @@
  *     boxes, node splitting, choose-subtree and underflow handling are ported
  *     faithfully from the reference so results match.
  *
- * Haversine / radius math stays in JS (see src/rtree-wasm.js): C returns the
- * candidate entries within a query bounding box and JS applies the distance
- * filter, matching the reference exactly.
+ * Radius search is fully in C: rtree_search_radius converts the radius to a
+ * bounding box, traverses the tree and applies the haversine distance filter,
+ * all using c/geo.c (WASM libm). Results may differ from the JS reference by a
+ * few ULPs in the reported distances, which is acceptable.
  *
  * All operations return BJ_OK (0) or a negative BJ_ERR_* code from binjson.h.
  */
@@ -64,6 +65,14 @@ int rtree_clear(rtree *t);
 int rtree_search_bbox(rtree *t, double min_lat, double max_lat,
                       double min_lng, double max_lng,
                       const uint8_t **out_ptr, size_t *out_len);
+
+/*
+ * Collect all entries within `radius_km` of (lat, lng), as a binjson ARRAY of
+ * { objectId, lat, lng, distance } objects (distance in km). The encoded bytes
+ * are exposed via out_ptr/out_len (valid until the next op).
+ */
+int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
+                        const uint8_t **out_ptr, size_t *out_len);
 
 /*
  * Rewrite the reachable nodes into a fresh, compacted image (dropping stale

@@ -7,6 +7,7 @@
  * binjson.c so the on-disk bytes match the JS implementation.
  */
 #include "rtree.h"
+#include "geo.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -901,6 +902,58 @@ int rtree_search_bbox(rtree *t, double min_lat, double max_lat,
     if (!b) return BJ_ERR_OOM;
     bj_begin_array(b);
     int e = search_rec(t, t->root, &q, b);
+    bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len;
+        const uint8_t *d = bj_builder_data(b, &len);
+        if (!d) e = BJ_ERR_STATE;
+        else if (!(e = set_out(t, d, len))) { *out_ptr = t->out.data; *out_len = t->out.len; }
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* Like search_rec, but filters leaf entries by haversine distance and emits a
+ * `distance` field (mirrors src/rtree.js searchRadius / _searchBBoxEntries). */
+static int search_radius_rec(rtree *t, double ptr, const rbbox *q,
+                             double lat, double lng, double radius_km, bj_builder *b) {
+    rnode nd;
+    int e = parse_node(t, ptr, &nd);
+    if (e) return e;
+    if (!nd.bbox.valid || !bbox_intersects(q, &nd.bbox)) { node_free(&nd); return BJ_OK; }
+
+    if (nd.is_leaf) {
+        for (int i = 0; i < nd.n; i++) {
+            if (!bbox_intersects(q, &nd.entries[i].bbox)) continue;
+            double dist = geo_haversine_distance(lat, lng, nd.entries[i].lat, nd.entries[i].lng);
+            if (dist > radius_km) continue;
+            bj_begin_object(b);
+            bj_put_key(b, (const uint8_t *)"objectId", 8); bj_put_oid(b, nd.entries[i].oid);
+            bj_put_key(b, (const uint8_t *)"lat", 3);       emit_number(b, nd.entries[i].lat);
+            bj_put_key(b, (const uint8_t *)"lng", 3);       emit_number(b, nd.entries[i].lng);
+            bj_put_key(b, (const uint8_t *)"distance", 8);  emit_number(b, dist);
+            bj_end_object(b);
+        }
+    } else {
+        for (int i = 0; i < nd.n; i++) {
+            e = search_radius_rec(t, nd.children[i], q, lat, lng, radius_km, b);
+            if (e) { node_free(&nd); return e; }
+        }
+    }
+    node_free(&nd);
+    return bj_builder_error(b);
+}
+
+int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
+                        const uint8_t **out_ptr, size_t *out_len) {
+    double min_lat, max_lat, min_lng, max_lng;
+    geo_radius_to_bbox(lat, lng, radius_km, &min_lat, &max_lat, &min_lng, &max_lng);
+    rbbox q = { 1, min_lat, max_lat, min_lng, max_lng };
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_array(b);
+    int e = search_radius_rec(t, t->root, &q, lat, lng, radius_km, b);
     bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {

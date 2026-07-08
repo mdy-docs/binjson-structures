@@ -10,6 +10,7 @@
  * after any call before touching a returned pointer.
  */
 #include "rtree.h"
+#include "geo.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -41,6 +42,16 @@ EMSCRIPTEN_KEEPALIVE int rtw_search(rtree *t, double min_lat, double max_lat,
                                     double min_lng, double max_lng) {
     const uint8_t *p; size_t n;
     return rtree_search_bbox(t, min_lat, max_lat, min_lng, max_lng, &p, &n);
+}
+
+EMSCRIPTEN_KEEPALIVE int rtw_search_radius(rtree *t, double lat, double lng, double radius_km) {
+    const uint8_t *p; size_t n;
+    return rtree_search_radius(t, lat, lng, radius_km, &p, &n);
+}
+
+/* Standalone haversine (km) for the exported haversineDistance utility. */
+EMSCRIPTEN_KEEPALIVE double rtw_haversine(double lat1, double lng1, double lat2, double lng2) {
+    return geo_haversine_distance(lat1, lng1, lat2, lng2);
 }
 
 EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t) {

@@ -466,6 +466,7 @@ static int parse_metadata(bpt *t) {
 
 typedef struct {
     int      is_split;
+    int      updated;     /* 1 if an existing key's value was replaced   */
     bpt_node newn;        /* when !is_split                              */
     bpt_node left, right; /* when is_split (not yet saved)               */
     bpt_key  split_key;   /* when is_split                               */
@@ -492,6 +493,7 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
             e = node_build_leaf(&out->newn, nd.id, nd.keys, wv, nd.n_keys, 0, 0);
             free(wv);
             out->is_split = 0;
+            out->updated = 1;
             node_free(&nd);
             return e;
         }
@@ -542,6 +544,7 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
         e = node_build_internal(&out->newn, nd.id, nd.keys, nd.n_keys, wc, nd.n_children);
         free(wc);
         out->is_split = 0;
+        out->updated = cr.updated;
         node_free(&nd);
         return e;
     }
@@ -606,7 +609,8 @@ int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
     node_free(&new_root);
     if (e) return e;
     t->root = rootp;
-    t->size += 1;
+    /* Updating an existing key leaves the number of distinct keys unchanged. */
+    if (!res.updated) t->size += 1;
     return save_metadata(t);
 }
 
