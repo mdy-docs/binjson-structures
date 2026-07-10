@@ -1045,25 +1045,61 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
 
 /* ---- Compaction ----------------------------------------------------- */
 
-typedef struct { double *olds, *news; int n, cap; } ptrmap;
+/* Cap on tree depth while walking file-provided pointers: a corrupt file
+ * whose child pointer loops back to an ancestor must error, not recurse
+ * forever. Vastly deeper than any real tree (height is O(log n)). */
+#define RT_MAX_DEPTH 128
 
-static int ptrmap_get(ptrmap *m, double old, double *found) {
-    for (int i = 0; i < m->n; i++) if (m->olds[i] == old) { *found = m->news[i]; return 1; }
+/* Open-addressing old-offset -> new-offset map (offsets are exact u64s). */
+typedef struct { uint64_t *olds, *news; uint8_t *used; size_t n, cap; } ptrmap;
+
+static size_t ptrmap_hash(uint64_t k, size_t cap) {
+    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
+    k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33;
+    return (size_t)k & (cap - 1);
+}
+static int ptrmap_get(const ptrmap *m, double old, double *found) {
+    if (!m->cap) return 0;
+    uint64_t k = (uint64_t)old;
+    for (size_t i = ptrmap_hash(k, m->cap); m->used[i]; i = (i + 1) & (m->cap - 1)) {
+        if (m->olds[i] == k) { *found = (double)m->news[i]; return 1; }
+    }
     return 0;
 }
 static int ptrmap_put(ptrmap *m, double old, double neu) {
-    if (m->n == m->cap) {
-        int nc = m->cap ? m->cap * 2 : 16;
-        double *no = (double *)realloc(m->olds, (size_t)nc * sizeof(double));
-        double *nn = (double *)realloc(m->news, (size_t)nc * sizeof(double));
-        if (!no || !nn) { free(no != m->olds ? no : NULL); return BJ_ERR_OOM; }
-        m->olds = no; m->news = nn; m->cap = nc;
+    if (m->n * 2 >= m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 64;
+        uint64_t *no = (uint64_t *)malloc(nc * sizeof(uint64_t));
+        uint64_t *nn = (uint64_t *)malloc(nc * sizeof(uint64_t));
+        uint8_t  *nu = (uint8_t *)calloc(nc, 1);
+        if (!no || !nn || !nu) { free(no); free(nn); free(nu); return BJ_ERR_OOM; }
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!m->used[i]) continue;
+            size_t j = ptrmap_hash(m->olds[i], nc);
+            while (nu[j]) j = (j + 1) & (nc - 1);
+            no[j] = m->olds[i]; nn[j] = m->news[i]; nu[j] = 1;
+        }
+        free(m->olds); free(m->news); free(m->used);
+        m->olds = no; m->news = nn; m->used = nu; m->cap = nc;
     }
-    m->olds[m->n] = old; m->news[m->n] = neu; m->n++;
+    uint64_t k = (uint64_t)old;
+    size_t i = ptrmap_hash(k, m->cap);
+    while (m->used[i]) {
+        if (m->olds[i] == k) { m->news[i] = (uint64_t)neu; return BJ_OK; }
+        i = (i + 1) & (m->cap - 1);
+    }
+    m->olds[i] = k; m->news[i] = (uint64_t)neu; m->used[i] = 1; m->n++;
     return BJ_OK;
 }
+static void ptrmap_free(ptrmap *m) {
+    free(m->olds); free(m->news); free(m->used);
+    memset(m, 0, sizeof(*m));
+}
 
-static int clone_node(rtree *t, bjfile *dst, ptrmap *m, double old_off, double *new_off) {
+static int clone_node(rtree *t, bjfile *dst, ptrmap *m, double old_off,
+                      double *new_off, int depth) {
+    if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     if (ptrmap_get(m, old_off, new_off)) return BJ_OK;
     rnode nd;
     int e = parse_node(t, old_off, &nd);
@@ -1071,7 +1107,7 @@ static int clone_node(rtree *t, bjfile *dst, ptrmap *m, double old_off, double *
     if (!nd.is_leaf) {
         for (int i = 0; i < nd.n; i++) {
             double nc;
-            e = clone_node(t, dst, m, nd.children[i], &nc);
+            e = clone_node(t, dst, m, nd.children[i], &nc, depth + 1);
             if (e) { node_free(&nd); return e; }
             nd.children[i] = nc;
         }
@@ -1089,10 +1125,10 @@ int rtree_compact(rtree *t, const bj_io *dst_io) {
     ptrmap m; memset(&m, 0, sizeof(m));
     double new_root = 0;
     int e = bjfile_append_header(&dst, t->bld, "rtree");
-    if (!e) e = clone_node(t, &dst, &m, t->root, &new_root);
+    if (!e) e = clone_node(t, &dst, &m, t->root, &new_root, 0);
     if (!e) e = encode_metadata(t, &dst, new_root);
     if (!e) e = bjfile_commit(&dst);
-    free(m.olds); free(m.news);
+    ptrmap_free(&m);
     bjfile_dispose(&dst);
     return e;
 }

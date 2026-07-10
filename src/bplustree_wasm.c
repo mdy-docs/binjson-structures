@@ -94,6 +94,12 @@ EMSCRIPTEN_KEEPALIVE int bptw_height(bpt *t) {
     return e ? e : h;
 }
 
+/* Stream a compacted (bulk-loaded) copy into the empty destination handle. */
+EMSCRIPTEN_KEEPALIVE int bptw_compact(bpt *t, int dst_fd) {
+    bj_io dst = bjio_host(dst_fd);
+    return bpt_compact(t, &dst);
+}
+
 EMSCRIPTEN_KEEPALIVE double bptw_size(bpt *t)    { return bpt_size(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return bpt_root(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return bpt_next_id(t); }

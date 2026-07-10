@@ -175,9 +175,9 @@ static int node_build_internal(bpt_node *out, double id, const bpt_key *keys,
 
 /* ---- File append & output buffer ------------------------------------ */
 
-static int file_append(bpt *t, const uint8_t *b, size_t n, double *off) {
+static int file_append_to(bjfile *dst, const uint8_t *b, size_t n, double *off) {
     uint64_t o;
-    int e = bjfile_append(&t->f, b, n, &o);
+    int e = bjfile_append(dst, b, n, &o);
     if (e) return e;
     if (off) *off = (double)o;
     return BJ_OK;
@@ -375,8 +375,8 @@ static int emit_key(bj_builder *b, const bpt_key *k) {
     return bj_put_float(b, k->num);
 }
 
-/* Encode `nd` and append it to the image; return its offset via *off. */
-static int save_node(bpt *t, const bpt_node *nd, double *off) {
+/* Encode `nd` and append it to `dst`; return its offset via *off. */
+static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, double *off) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
@@ -404,21 +404,27 @@ static int save_node(bpt *t, const bpt_node *nd, double *off) {
     size_t len;
     const uint8_t *d = bj_builder_data(b, &len);
     if (!d) return BJ_ERR_STATE;
-    return file_append(t, d, len, off);
+    return file_append_to(dst, d, len, off);
+}
+
+/* Append `nd` to the tree's live file. */
+static int save_node(bpt *t, const bpt_node *nd, double *off) {
+    return encode_node_to(t, nd, &t->f, off);
 }
 
 /* ---- Metadata ------------------------------------------------------- */
 
-static int save_metadata(bpt *t) {
+static int encode_metadata_to(bpt *t, bjfile *dst, double root,
+                              double next_id, double size) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
     bj_put_key(b, (const uint8_t *)"version", 7);      bj_put_int(b, 1);
     bj_put_key(b, (const uint8_t *)"maxEntries", 10);  bj_put_int(b, t->order);
     bj_put_key(b, (const uint8_t *)"minEntries", 10);  bj_put_int(b, t->min_keys);
-    bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, (int64_t)t->size);
-    bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, (uint64_t)t->root);
-    bj_put_key(b, (const uint8_t *)"nextId", 6);       bj_put_int(b, (int64_t)t->next_id);
+    bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, (int64_t)size);
+    bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, (uint64_t)root);
+    bj_put_key(b, (const uint8_t *)"nextId", 6);       bj_put_int(b, (int64_t)next_id);
     bj_end_object(b);
 
     int e = bj_builder_error(b);
@@ -428,7 +434,11 @@ static int save_metadata(bpt *t) {
     if (!d) return BJ_ERR_STATE;
     /* Metadata ends every commit; a CRC trailer written just before it covers
      * all of the operation's appended bytes (bjfile_append_protected). */
-    return bjfile_append_protected(&t->f, d, len);
+    return bjfile_append_protected(dst, d, len);
+}
+
+static int save_metadata(bpt *t) {
+    return encode_metadata_to(t, &t->f, t->root, t->next_id, t->size);
 }
 
 typedef struct {
@@ -836,6 +846,231 @@ int bpt_height(bpt *t, int *out_height) {
     }
     *out_height = h;
     return BJ_OK;
+}
+
+/* ---- Compaction (bulk load) ------------------------------------------ */
+
+/*
+ * Compaction rebuilds the tree into a destination file with a classic B+ tree
+ * bulk load: source entries are streamed in key order into per-level node
+ * accumulators that are written the moment they reach capacity. The result is
+ * a minimal, fully-packed tree — no append-only history, no per-entry
+ * metadata records, and none of the empty-leaf cruft deletions leave behind —
+ * produced in O(N) time with O(height) memory.
+ *
+ * Separator invariant (matches what insert splits produce): the key stored in
+ * an internal node between children i and i+1 is the smallest key of child
+ * i+1's subtree; leaf separators stay duplicated in the right leaf, internal
+ * separators are promoted upward and not kept in the node.
+ */
+
+/* Cap on tree depth while walking file-provided pointers: a corrupt file
+ * whose child pointer loops back to an ancestor must error, not recurse
+ * forever. Vastly deeper than any real tree (height is O(log n)). */
+#define BPT_MAX_DEPTH 128
+
+typedef struct {
+    bpt_key  *keys;     int n_keys;       /* up to order-1                  */
+    bpt_blob *vals;     int n_vals;       /* level 0 only                   */
+    double   *children; int n_children;   /* levels > 0, up to order        */
+    bpt_key   node_sep; int has_sep;      /* separator preceding this node  */
+    int       emitted;                    /* nodes already written at level */
+} bl_level;
+
+typedef struct {
+    bpt      *t;
+    bjfile   *dst;
+    bl_level *levels;
+    int       n_levels, cap_levels;
+    double    next_id;
+    double    fed;                        /* entries streamed in            */
+} bulk_loader;
+
+static int bl_ensure_level(bulk_loader *bl, int L) {
+    if (L < bl->n_levels) return BJ_OK;
+    if (L >= bl->cap_levels) {
+        int nc = bl->cap_levels ? bl->cap_levels * 2 : 8;
+        while (nc <= L) nc *= 2;
+        bl_level *nl = (bl_level *)realloc(bl->levels, (size_t)nc * sizeof(bl_level));
+        if (!nl) return BJ_ERR_OOM;
+        bl->levels = nl;
+        bl->cap_levels = nc;
+    }
+    while (bl->n_levels <= L) {
+        bl_level *lev = &bl->levels[bl->n_levels];
+        memset(lev, 0, sizeof(*lev));
+        int order = bl->t->order;
+        lev->keys = (bpt_key *)calloc((size_t)order, sizeof(bpt_key));
+        if (!lev->keys) return BJ_ERR_OOM;
+        if (bl->n_levels == 0) {
+            lev->vals = (bpt_blob *)calloc((size_t)order, sizeof(bpt_blob));
+            if (!lev->vals) return BJ_ERR_OOM;
+        } else {
+            lev->children = (double *)calloc((size_t)order, sizeof(double));
+            if (!lev->children) return BJ_ERR_OOM;
+        }
+        bl->n_levels++;
+    }
+    return BJ_OK;
+}
+
+/* Write level L's in-progress node to the destination; contents are consumed
+ * (freed) but the arrays are kept for reuse. */
+static int bl_write_node(bulk_loader *bl, int L, double *ptr) {
+    bl_level *lev = &bl->levels[L];
+    bpt_node nd;
+    node_init(&nd);
+    nd.id = bl->next_id++;
+    nd.is_leaf = (L == 0);
+    nd.keys = lev->keys;         nd.n_keys = lev->n_keys;
+    nd.values = lev->vals;       nd.n_values = lev->n_vals;
+    nd.children = lev->children; nd.n_children = lev->n_children;
+    int e = encode_node_to(bl->t, &nd, bl->dst, ptr);
+    for (int i = 0; i < lev->n_keys; i++) key_free(&lev->keys[i]);
+    for (int i = 0; i < lev->n_vals; i++) blob_free(&lev->vals[i]);
+    lev->n_keys = lev->n_vals = lev->n_children = 0;
+    lev->emitted++;
+    return e;
+}
+
+/*
+ * Add a finished child node to level L. `sep` is the separator preceding
+ * `ptr` (ownership transferred; has_sep 0 for a level's very first child).
+ * When the level's node is full it is written out first, its own preceding
+ * separator promoted upward with it, and the new node starts with `ptr`.
+ */
+static int bl_add_child(bulk_loader *bl, int L, int has_sep, bpt_key *sep, double ptr) {
+    int e = bl_ensure_level(bl, L);
+    if (e) { if (has_sep) key_free(sep); return e; }
+    bl_level *lev = &bl->levels[L];
+
+    if (lev->n_children == 0) {
+        /* Very first child of this level. */
+        lev->children[lev->n_children++] = ptr;
+        lev->has_sep = has_sep;
+        if (has_sep) lev->node_sep = *sep;
+        return BJ_OK;
+    }
+    if (lev->n_children == bl->t->order) {
+        double p;
+        e = bl_write_node(bl, L, &p);
+        if (e) { if (has_sep) key_free(sep); return e; }
+        int up_has = lev->has_sep;
+        bpt_key up = lev->node_sep;
+        lev->has_sep = has_sep;
+        if (has_sep) lev->node_sep = *sep;
+        lev->children[lev->n_children++] = ptr;
+        return bl_add_child(bl, L + 1, up_has, &up, p);
+    }
+    /* Every non-first child carries a separator by construction. */
+    if (!has_sep) return BJ_ERR_STATE;
+    lev->keys[lev->n_keys++] = *sep;   /* room: separator joins the node */
+    lev->children[lev->n_children++] = ptr;
+    return BJ_OK;
+}
+
+/* Stream one entry (key ordering is the caller's responsibility; ownership of
+ * key/val transfers on success). */
+static int bl_add_entry(bulk_loader *bl, bpt_key *key, bpt_blob *val) {
+    int e = bl_ensure_level(bl, 0);
+    if (e) return e;
+    bl_level *lev = &bl->levels[0];
+
+    if (lev->n_keys == bl->t->order - 1) {
+        double p;
+        e = bl_write_node(bl, 0, &p);
+        if (e) return e;
+        int up_has = lev->has_sep;
+        bpt_key up = lev->node_sep;
+        /* The incoming key starts (and precedes) the new leaf. */
+        e = key_copy(&lev->node_sep, key);
+        if (e) { if (up_has) key_free(&up); return e; }
+        lev->has_sep = 1;
+        e = bl_add_child(bl, 1, up_has, &up, p);
+        if (e) return e;
+    }
+    lev->keys[lev->n_keys++] = *key;
+    lev->vals[lev->n_vals++] = *val;
+    bl->fed += 1;
+    return BJ_OK;
+}
+
+/* Flush remaining partial nodes bottom-up; the sole node at the highest
+ * populated level becomes the root. */
+static int bl_finish(bulk_loader *bl, double *root) {
+    int e = bl_ensure_level(bl, 0);   /* empty tree: emit an empty leaf */
+    if (e) return e;
+    for (int L = 0; ; L++) {
+        bl_level *lev = &bl->levels[L];
+        if (lev->emitted == 0 && L == bl->n_levels - 1) {
+            return bl_write_node(bl, L, root);
+        }
+        double p;
+        e = bl_write_node(bl, L, &p);
+        if (e) return e;
+        int up_has = lev->has_sep;
+        bpt_key up = lev->node_sep;
+        lev->has_sep = 0;
+        e = bl_add_child(bl, L + 1, up_has, &up, p);
+        if (e) return e;
+    }
+}
+
+static void bl_dispose(bulk_loader *bl) {
+    for (int L = 0; L < bl->n_levels; L++) {
+        bl_level *lev = &bl->levels[L];
+        for (int i = 0; i < lev->n_keys; i++) key_free(&lev->keys[i]);
+        for (int i = 0; i < lev->n_vals; i++) blob_free(&lev->vals[i]);
+        if (lev->has_sep) key_free(&lev->node_sep);
+        free(lev->keys);
+        free(lev->vals);
+        free(lev->children);
+    }
+    free(bl->levels);
+}
+
+/* In-order walk of the source tree, streaming leaf entries into the loader.
+ * Ownership of each entry's key/value moves into the loader. */
+static int compact_walk(bpt *t, double ptr, bulk_loader *bl, int depth) {
+    if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
+    bpt_node nd;
+    int e = parse_node(t, ptr, &nd);
+    if (e) return e;
+    if (nd.is_leaf) {
+        for (int i = 0; i < nd.n_keys && !e; i++) {
+            e = bl_add_entry(bl, &nd.keys[i], &nd.values[i]);
+            if (!e) {
+                /* consumed: stop node_free from double-freeing */
+                nd.keys[i].is_string = 0; nd.keys[i].str = NULL;
+                nd.values[i].bytes = NULL;
+            }
+        }
+    } else {
+        for (int i = 0; i < nd.n_children && !e; i++)
+            e = compact_walk(t, nd.children[i], bl, depth + 1);
+    }
+    node_free(&nd);
+    return e;
+}
+
+int bpt_compact(bpt *t, const bj_io *dst_io) {
+    bjfile dst;
+    bjfile_init(&dst, dst_io);
+    dst.autoflush = 1u << 18;   /* stream to the host in ~256 KB chunks */
+    bulk_loader bl;
+    memset(&bl, 0, sizeof(bl));
+    bl.t = t;
+    bl.dst = &dst;
+
+    int e = bjfile_append_header(&dst, t->bld, "bplustree");
+    if (!e) e = compact_walk(t, t->root, &bl, 0);
+    double root = 0;
+    if (!e) e = bl_finish(&bl, &root);
+    if (!e) e = encode_metadata_to(t, &dst, root, bl.next_id, bl.fed);
+    if (!e) e = bjfile_commit(&dst);
+    bl_dispose(&bl);
+    bjfile_dispose(&dst);
+    return e;
 }
 
 /* ---- Lifecycle & accessors ------------------------------------------ */

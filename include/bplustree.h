@@ -76,6 +76,14 @@ int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
 /* Tree height (0 for a single leaf). */
 int bpt_height(bpt *t, int *out_height);
 
+/*
+ * Rewrite the live entries (dropping append-only history and deletion cruft)
+ * into the destination file `dst`, which is expected to be empty, as a
+ * minimal fully-packed tree via a bulk load. Records are streamed to the
+ * host in chunks; memory use is O(height).
+ */
+int bpt_compact(bpt *t, const bj_io *dst);
+
 #ifdef __cplusplus
 }
 #endif
