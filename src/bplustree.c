@@ -21,6 +21,11 @@
  * bplustree.js): 6 fields, all fixed-width INT/POINTER values. */
 #define BPT_METADATA_SIZE 135
 
+/* Cap on tree depth while walking file-provided pointers: a corrupt file
+ * whose child pointer loops back to an ancestor must error, not recurse
+ * forever. Vastly deeper than any real tree (height is O(log n)). */
+#define BPT_MAX_DEPTH 128
+
 /* ---- Values, keys, nodes -------------------------------------------- */
 
 typedef struct { uint8_t *bytes; uint32_t len; } bpt_blob;
@@ -781,9 +786,16 @@ int bpt_search(bpt *t, const bpt_key *key, int *found,
     }
 }
 
-/* In-order emit of { key, value } objects, optionally filtered to [mn, mx]. */
+/*
+ * In-order emit of { key, value } objects, optionally filtered to [mn, mx].
+ * Internal nodes prune the descent with their routing keys: child i covers
+ * [keys[i-1], keys[i]) (open ends at the edges), so only children whose span
+ * can overlap the range are visited — a range scan reads O(height) nodes
+ * plus the leaves that actually hold matches, not the whole tree.
+ */
 static int collect(bpt *t, double ptr, bj_builder *b, int filt,
-                   const bpt_key *mn, const bpt_key *mx) {
+                   const bpt_key *mn, const bpt_key *mx, int depth) {
+    if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
     bpt_node nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -796,8 +808,18 @@ static int collect(bpt *t, double ptr, bj_builder *b, int filt,
             bj_end_object(b);
         }
     } else {
-        for (int i = 0; i < nd.n_children; i++) {
-            e = collect(t, nd.children[i], b, filt, mn, mx);
+        int lo = 0, hi = nd.n_children - 1;
+        if (filt) {
+            /* Same descent rule as bpt_search (equal keys route right):
+             * children before mn's child hold only keys < mn; children
+             * after mx's child hold only keys > mx. */
+            lo = 0;
+            while (lo < nd.n_keys && key_cmp(mn, &nd.keys[lo]) >= 0) lo++;
+            hi = 0;
+            while (hi < nd.n_keys && key_cmp(mx, &nd.keys[hi]) >= 0) hi++;
+        }
+        for (int i = lo; i <= hi && i < nd.n_children; i++) {
+            e = collect(t, nd.children[i], b, filt, mn, mx, depth + 1);
             if (e) { node_free(&nd); return e; }
         }
     }
@@ -810,7 +832,7 @@ static int collect_to_out(bpt *t, int filt, const bpt_key *mn, const bpt_key *mx
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     bj_begin_array(b);
-    int e = collect(t, t->root, b, filt, mn, mx);
+    int e = collect(t, t->root, b, filt, mn, mx, 0);
     bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -863,11 +885,6 @@ int bpt_height(bpt *t, int *out_height) {
  * i+1's subtree; leaf separators stay duplicated in the right leaf, internal
  * separators are promoted upward and not kept in the node.
  */
-
-/* Cap on tree depth while walking file-provided pointers: a corrupt file
- * whose child pointer loops back to an ancestor must error, not recurse
- * forever. Vastly deeper than any real tree (height is O(log n)). */
-#define BPT_MAX_DEPTH 128
 
 typedef struct {
     bpt_key  *keys;     int n_keys;       /* up to order-1                  */
