@@ -1,15 +1,19 @@
 /*
  * rtree_wasm.c — Emscripten glue over the host-agnostic tree in rtree.c.
  *
- * A tree is created/loaded on the C side and its pointer handed back to JS as an
- * opaque integer handle (WASM pointers are 32-bit ints). Points are passed as
- * (lat, lng) doubles plus a 12-byte ObjectId (ptr). Search/compact outputs are
- * exposed through the tree's own output buffer via rtw_out_ptr / rtw_out_len.
+ * A tree is created/opened against a JS-registered sync access handle (an `fd`
+ * slot in Module.bjioHandles — see hostio.h) and its pointer handed back to JS
+ * as an opaque integer handle (WASM pointers are 32-bit ints). Points are
+ * passed as (lat, lng) doubles plus a 12-byte ObjectId (ptr). Search outputs
+ * are exposed through the tree's own output buffer via rtw_out_ptr /
+ * rtw_out_len. All file reads and writes flow through the fd's handle; no copy
+ * of the file lives in WASM memory.
  *
  * Memory: heap growth may swap HEAPU8's ArrayBuffer, so JS must re-read HEAPU8
  * after any call before touching a returned pointer.
  */
 #include "rtree.h"
+#include "hostio.h"
 #include "geo.h"
 
 #ifdef __EMSCRIPTEN__
@@ -18,9 +22,13 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
-EMSCRIPTEN_KEEPALIVE rtree *rtw_create(int max_entries) { return rtree_create(max_entries); }
-EMSCRIPTEN_KEEPALIVE rtree *rtw_load(const uint8_t *bytes, int len) {
-    return rtree_load(bytes, (size_t)len);
+EMSCRIPTEN_KEEPALIVE rtree *rtw_create(int fd, int max_entries) {
+    bj_io io = bjio_host(fd);
+    return rtree_create(&io, max_entries);
+}
+EMSCRIPTEN_KEEPALIVE rtree *rtw_open(int fd) {
+    bj_io io = bjio_host(fd);
+    return rtree_open(&io);
 }
 EMSCRIPTEN_KEEPALIVE void rtw_free(rtree *t) { rtree_free(t); }
 
@@ -54,9 +62,10 @@ EMSCRIPTEN_KEEPALIVE double rtw_haversine(double lat1, double lng1, double lat2,
     return geo_haversine_distance(lat1, lng1, lat2, lng2);
 }
 
-EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t) {
-    const uint8_t *p; size_t n;
-    return rtree_compact(t, &p, &n);
+/* Stream a compacted copy into the (empty) destination handle `dst_fd`. */
+EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t, int dst_fd) {
+    bj_io dst = bjio_host(dst_fd);
+    return rtree_compact(t, &dst);
 }
 
 EMSCRIPTEN_KEEPALIVE double rtw_size(rtree *t)        { return rtree_size(t); }
@@ -67,10 +76,4 @@ EMSCRIPTEN_KEEPALIVE const uint8_t *rtw_out_ptr(rtree *t) {
 }
 EMSCRIPTEN_KEEPALIVE int rtw_out_len(rtree *t) {
     size_t n; rtree_out(t, &n); return (int)n;
-}
-EMSCRIPTEN_KEEPALIVE const uint8_t *rtw_image_ptr(rtree *t) {
-    size_t n; return rtree_image(t, &n);
-}
-EMSCRIPTEN_KEEPALIVE int rtw_image_len(rtree *t) {
-    size_t n; rtree_image(t, &n); return (int)n;
 }

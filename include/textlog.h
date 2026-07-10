@@ -3,11 +3,14 @@
  * src/textlog.js.
  *
  * Design (mirrors rtree.h / rtree.c):
- *   - A log owns an in-memory byte "image" mirroring the append-only file:
- *     entries (full snapshots or diffs) and metadata records are appended
- *     verbatim, and the host (JS) writes the image back to storage on
- *     flush/close. Entries and metadata use the binjson wire format from
- *     binjson.c.
+ *   - The log is file-resident: entries (full snapshots or diffs) and metadata
+ *     records are read from and appended to the backing file through the bj_io
+ *     callbacks (bjio.h) supplied at create/open. No copy of the file is kept
+ *     in memory; the only in-memory state is a small index of entry offsets
+ *     built during open, so reads fetch exactly the records a version needs.
+ *     Entries and metadata use the binjson wire format from binjson.c.
+ *   - If the file ends in a torn/partial record (e.g. a crash mid-append),
+ *     open recovers to the last valid record and truncates the tail.
  *   - Unlike src/textlog.js — which delegates diffing to the `diff` npm package
  *     and hashing to node's crypto — everything lives in C here: SHA-256, the
  *     internal (opaque) prefix/suffix diff used to store DIFF entries, and the
@@ -26,6 +29,7 @@
 #include <stddef.h>
 
 #include "binjson.h"
+#include "bjio.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,20 +41,18 @@ typedef struct textlog textlog;
 #define TL_FULL_SNAPSHOT 0x01
 #define TL_DIFF          0x02
 
-/* Create a fresh empty log (diffs_per_snapshot >= 1). Writes the initial
- * metadata record. Returns NULL on OOM or bad argument. */
-textlog *textlog_create(int diffs_per_snapshot);
-/* Load an existing log from a file image (copies `len` bytes). Returns NULL on
- * OOM or if no valid metadata record is found. */
-textlog *textlog_load(const uint8_t *bytes, size_t len);
-/* Free a log and all its buffers. Safe to pass NULL. */
+/* Create a fresh empty log (diffs_per_snapshot >= 1) on `io` (expected empty)
+ * and write the initial metadata record. Returns NULL on OOM/bad argument. */
+textlog *textlog_create(const bj_io *io, int diffs_per_snapshot);
+/* Open an existing log from `io`, scanning it once to index entry offsets.
+ * Returns NULL on OOM or if no valid metadata record is found. */
+textlog *textlog_open(const bj_io *io);
+/* Free a log and all its buffers (does not touch the file). Safe on NULL. */
 void textlog_free(textlog *t);
 
 /* Accessors (mirror the JS metadata fields). */
 double         textlog_version(const textlog *t);
 int            textlog_diffs_per_snapshot(const textlog *t);
-/* The full file image; writes its length through *len. */
-const uint8_t *textlog_image(const textlog *t, size_t *len);
 /* The last read output (getVersion / getVersionHash / getDiff); *len set. */
 const uint8_t *textlog_out(const textlog *t, size_t *len);
 

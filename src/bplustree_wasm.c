@@ -1,17 +1,21 @@
 /*
  * bplustree_wasm.c — Emscripten glue over the host-agnostic tree in bplustree.c.
  *
- * A tree is created/loaded on the C side and its pointer handed back to JS as an
- * opaque integer handle (WASM pointers are 32-bit ints). All operations take that
- * handle plus a marshalled key: (type, num, strPtr, strLen) where type 0 = number
- * and type 1 = string. Values are pre-encoded binjson blobs (ptr+len) produced by
- * the JS side. Outputs (search value / entries / range) are exposed through the
- * tree's own output buffer via bptw_out_ptr / bptw_out_len.
+ * A tree is created/opened against a JS-registered sync access handle (an `fd`
+ * slot in Module.bjioHandles — see hostio.h) and its pointer handed back to JS
+ * as an opaque integer handle (WASM pointers are 32-bit ints). All operations
+ * take that handle plus a marshalled key: (type, num, strPtr, strLen) where
+ * type 0 = number and type 1 = string. Values are pre-encoded binjson blobs
+ * (ptr+len) produced by the JS side. Outputs (search value / entries / range)
+ * are exposed through the tree's own output buffer via bptw_out_ptr /
+ * bptw_out_len. All file reads and writes flow through the fd's handle; no
+ * copy of the file lives in WASM memory.
  *
  * Memory: heap growth may swap HEAPU8's ArrayBuffer, so JS must re-read HEAPU8
  * after any call before touching a returned pointer.
  */
 #include "bplustree.h"
+#include "hostio.h"
 
 #include <stdlib.h>
 
@@ -35,9 +39,13 @@ static bpt_key make_key(int type, double num, const uint8_t *sptr, int slen) {
 static const uint8_t *g_out_ptr = NULL;
 static size_t         g_out_len = 0;
 
-EMSCRIPTEN_KEEPALIVE bpt *bptw_create(int order) { return bpt_create(order); }
-EMSCRIPTEN_KEEPALIVE bpt *bptw_load(const uint8_t *bytes, int len) {
-    return bpt_load(bytes, (size_t)len);
+EMSCRIPTEN_KEEPALIVE bpt *bptw_create(int fd, int order) {
+    bj_io io = bjio_host(fd);
+    return bpt_create(&io, order);
+}
+EMSCRIPTEN_KEEPALIVE bpt *bptw_open(int fd) {
+    bj_io io = bjio_host(fd);
+    return bpt_open(&io);
 }
 EMSCRIPTEN_KEEPALIVE void bptw_free(bpt *t) { bpt_free(t); }
 
@@ -93,10 +101,3 @@ EMSCRIPTEN_KEEPALIVE int    bptw_order(bpt *t)   { return bpt_order(t); }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_out_ptr(void) { return g_out_ptr; }
 EMSCRIPTEN_KEEPALIVE int            bptw_out_len(void) { return (int)g_out_len; }
-
-EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_image_ptr(bpt *t) {
-    size_t len; return bpt_image(t, &len);
-}
-EMSCRIPTEN_KEEPALIVE int bptw_image_len(bpt *t) {
-    size_t len; bpt_image(t, &len); return (int)len;
-}

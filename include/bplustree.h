@@ -3,10 +3,11 @@
  * src/bplustree.js.
  *
  * Design (see the plan and src/bplustree.js):
- *   - A tree owns an in-memory byte "image" mirroring the append-only file:
- *     nodes and metadata are appended verbatim, and reads resolve by offset into
- *     the image. The host (JS) loads the existing file bytes on open and writes
- *     the image back to storage on flush/close — no per-node host callbacks.
+ *   - The tree is file-resident: nodes and metadata are read from and appended
+ *     to the backing file through the bj_io callbacks (bjio.h) supplied at
+ *     create/open. No copy of the file is kept in memory — reads fetch one
+ *     record at a time and each mutating operation appends its new nodes plus
+ *     fresh metadata with a single write, exactly like src/bplustree.js.
  *   - Nodes and metadata use the exact binjson wire format of bplustree.js, so
  *     files stay byte-compatible (bin/bplustree-decode.js can read them).
  *   - The tree compares only *keys* (number or string); *values* are opaque,
@@ -21,6 +22,7 @@
 #include <stddef.h>
 
 #include "binjson.h"
+#include "bjio.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,12 +38,13 @@ typedef struct {
 
 typedef struct bpt bpt;
 
-/* Create a fresh empty tree (order >= 3). Returns NULL on OOM. */
-bpt *bpt_create(int order);
-/* Load an existing tree from a file image (copies `len` bytes). Returns NULL on
- * OOM or if the image is too small / metadata is unreadable. */
-bpt *bpt_load(const uint8_t *bytes, size_t len);
-/* Free a tree and all its buffers. Safe to pass NULL. */
+/* Create a fresh tree (order >= 3) on `io` (expected empty) and write the
+ * initial root + metadata. Returns NULL on OOM or write failure. */
+bpt *bpt_create(const bj_io *io, int order);
+/* Open an existing tree from `io`. Returns NULL on OOM or if the file is too
+ * small / metadata is unreadable. */
+bpt *bpt_open(const bj_io *io);
+/* Free a tree and all its buffers (does not touch the file). Safe on NULL. */
 void bpt_free(bpt *t);
 
 /* Accessors (mirror the JS metadata fields). */
@@ -49,8 +52,6 @@ double         bpt_size(const bpt *t);
 double         bpt_root(const bpt *t);
 double         bpt_next_id(const bpt *t);
 int            bpt_order(const bpt *t);
-/* The full file image; writes its length through *len. */
-const uint8_t *bpt_image(const bpt *t, size_t *len);
 
 /* Insert/update. `val`/`val_len` is one pre-encoded binjson value (opaque). */
 int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t val_len);

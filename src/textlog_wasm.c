@@ -1,15 +1,19 @@
 /*
  * textlog_wasm.c — Emscripten glue over the host-agnostic log in textlog.c.
  *
- * A log is created/loaded on the C side and its pointer handed back to JS as an
- * opaque integer handle. Text is passed as (ptr, len) UTF-8 byte ranges; read
- * outputs (getVersion / getVersionHash / getDiff) are exposed through the log's
- * own output buffer via tlw_out_ptr / tlw_out_len.
+ * A log is created/opened against a JS-registered sync access handle (an `fd`
+ * slot in Module.bjioHandles — see hostio.h) and its pointer handed back to JS
+ * as an opaque integer handle. Text is passed as (ptr, len) UTF-8 byte ranges;
+ * read outputs (getVersion / getVersionHash / getDiff) are exposed through the
+ * log's own output buffer via tlw_out_ptr / tlw_out_len. All file reads and
+ * writes flow through the fd's handle; no copy of the file lives in WASM
+ * memory.
  *
  * Memory: heap growth may swap HEAPU8's ArrayBuffer, so JS must re-read HEAPU8
  * after any call before touching a returned pointer.
  */
 #include "textlog.h"
+#include "hostio.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -17,11 +21,13 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
-EMSCRIPTEN_KEEPALIVE textlog *tlw_create(int diffs_per_snapshot) {
-    return textlog_create(diffs_per_snapshot);
+EMSCRIPTEN_KEEPALIVE textlog *tlw_create(int fd, int diffs_per_snapshot) {
+    bj_io io = bjio_host(fd);
+    return textlog_create(&io, diffs_per_snapshot);
 }
-EMSCRIPTEN_KEEPALIVE textlog *tlw_load(const uint8_t *bytes, int len) {
-    return textlog_load(bytes, (size_t)len);
+EMSCRIPTEN_KEEPALIVE textlog *tlw_open(int fd) {
+    bj_io io = bjio_host(fd);
+    return textlog_open(&io);
 }
 EMSCRIPTEN_KEEPALIVE void tlw_free(textlog *t) { textlog_free(t); }
 
@@ -55,10 +61,4 @@ EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_out_ptr(textlog *t) {
 }
 EMSCRIPTEN_KEEPALIVE int tlw_out_len(textlog *t) {
     size_t n; textlog_out(t, &n); return (int)n;
-}
-EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_image_ptr(textlog *t) {
-    size_t n; return textlog_image(t, &n);
-}
-EMSCRIPTEN_KEEPALIVE int tlw_image_len(textlog *t) {
-    size_t n; textlog_image(t, &n); return (int)n;
 }

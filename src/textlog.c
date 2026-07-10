@@ -2,9 +2,11 @@
  * textlog.c — C port of src/textlog.js. See textlog.h.
  *
  * The log is persistent and append-only: every addVersion appends an entry
- * (full snapshot or diff) followed by a fresh metadata record to the in-memory
- * file image, exactly like the reference. Entries/metadata use the binjson wire
- * format from binjson.c.
+ * (full snapshot or diff) followed by a fresh metadata record to the backing
+ * file, exactly like the reference. Entries/metadata use the binjson wire
+ * format from binjson.c. All file access goes through bjfile (bjfile.h); an
+ * in-memory index of entry offsets (built by one scan at open) lets version
+ * reconstruction read only the snapshot + diff chain it actually needs.
  *
  * The on-disk format is byte-compatible with src/textlog.js, so files
  * interoperate with the JS log:
@@ -16,6 +18,7 @@
  * as the reference, so bytes match field-for-field.
  */
 #include "textlog.h"
+#include "bjfile.h"
 #include "diff.h"
 
 #include <stdlib.h>
@@ -260,11 +263,11 @@ typedef struct {
     int diffs_per_snapshot;
 } trec;
 
-/* Parse the object at (img+off) into *r. */
-static int parse_record(const uint8_t *img, size_t len, size_t off, trec *r) {
+/* Parse the record bytes (rec, len) into *r. The string fields point into
+ * `rec` and are only valid while those bytes are. */
+static int parse_record(const uint8_t *rec, size_t len, trec *r) {
     memset(r, 0, sizeof(*r));
-    if (off > len) return BJ_ERR_EOF;
-    cur c = { img + off, len - off, 0 };
+    cur c = { rec, len, 0 };
     uint32_t count;
     int e = object_begin(&c, &count);
     if (e) return e;
@@ -301,8 +304,17 @@ static int parse_record(const uint8_t *img, size_t len, size_t off, trec *r) {
 
 /* ---- Log state ------------------------------------------------------ */
 
+/* Index of one entry record: where it lives and what it is. Built by the
+ * open-time scan and extended on every addVersion, so reconstruction reads
+ * only the records a version actually needs. */
+typedef struct {
+    uint64_t off;
+    double   version;
+    uint8_t  type;               /* TL_FULL_SNAPSHOT / TL_DIFF          */
+} tl_ent;
+
 struct textlog {
-    dbuf        img;             /* file image                          */
+    bjfile      f;               /* backing file                        */
     dbuf        out;             /* last read output                    */
     bj_builder *bld;             /* reused for entry/metadata encoding  */
     double      version;
@@ -310,7 +322,18 @@ struct textlog {
     int         diffs_per_snapshot;
     int         has_snapshot; double snapshot_ptr;
     int         has_latest;   double latest_ptr;
+    tl_ent     *ents; int n_ents, cap_ents;   /* entry index            */
 };
+
+static int ents_reserve(textlog *t, int need) {
+    if (need <= t->cap_ents) return BJ_OK;
+    int nc = t->cap_ents ? t->cap_ents * 2 : 16;
+    while (nc < need) nc *= 2;
+    tl_ent *ne = (tl_ent *)realloc(t->ents, (size_t)nc * sizeof(tl_ent));
+    if (!ne) return BJ_ERR_OOM;
+    t->ents = ne; t->cap_ents = nc;
+    return BJ_OK;
+}
 
 static int set_out(textlog *t, const uint8_t *b, size_t n) {
     t->out.len = 0;
@@ -325,7 +348,7 @@ static int append_builder(textlog *t) {
     size_t len;
     const uint8_t *d = bj_builder_data(t->bld, &len);
     if (!d) return BJ_ERR_STATE;
-    return dbuf_put(&t->img, d, len);
+    return bjfile_append(&t->f, d, len, NULL);
 }
 
 static int encode_entry(textlog *t, int type, double version,
@@ -358,7 +381,14 @@ static int save_metadata(textlog *t) {
     bj_put_key(b, (const uint8_t *)"diffsPerSnapshot", 16);
     bj_put_int(b, t->diffs_per_snapshot);
     bj_end_object(b);
-    return append_builder(t);
+    int e = bj_builder_error(b);
+    if (e) return e;
+    size_t len;
+    const uint8_t *d = bj_builder_data(b, &len);
+    if (!d) return BJ_ERR_STATE;
+    /* Metadata ends every commit; a CRC trailer written just before it covers
+     * all of the operation's appended bytes (bjfile_append_protected). */
+    return bjfile_append_protected(&t->f, d, len);
 }
 
 /* ---- Version reconstruction ----------------------------------------- */
@@ -370,50 +400,51 @@ static int diff_err_to_bj(int e) {
 /*
  * Rebuild the full text of `version` into *text (reset first): start from the
  * latest snapshot at or before `version` and apply each subsequent DIFF entry's
- * patch in order, exactly like textlog.js getVersion.
+ * patch in order, exactly like textlog.js getVersion. The entry index makes
+ * this read only the snapshot + diff chain, not the whole file.
  */
 static int reconstruct_version(textlog *t, double version, dbuf *text) {
     text->len = 0;
-    double last_snap = -1;
-    size_t off = 0;
-    int e = BJ_OK;
-    while (off < t->img.len) {
-        size_t sz;
-        e = bj_value_size(t->img.data, t->img.len, off, &sz);
-        if (e) break;
+    int hi = t->n_ents - 1;
+    while (hi >= 0 && t->ents[hi].version > version) hi--;
+    if (hi < 0) return BJ_OK;   /* nothing at or before `version` */
+    int start = hi;
+    while (start >= 0 && t->ents[start].type != TL_FULL_SNAPSHOT) start--;
+    if (start < 0) return BJ_ERR_STATE;   /* diff chain without a snapshot */
+
+    for (int i = start; i <= hi; i++) {
+        const uint8_t *rec; size_t rec_len;
+        int e = bjfile_read_record(&t->f, t->ents[i].off, &rec, &rec_len);
+        if (e) return e;
         trec r;
-        e = parse_record(t->img.data, t->img.len, off, &r);
-        if (e) break;
-        off += sz;
-        if (!r.is_entry || r.version > version) continue;
+        e = parse_record(rec, rec_len, &r);
+        if (e) return e;
         if (r.type == TL_FULL_SNAPSHOT) {
             text->len = 0;
-            if ((e = dbuf_put(text, r.data, r.datalen))) break;
-            last_snap = r.version;
-        } else if (r.type == TL_DIFF && last_snap >= 1 && r.version > last_snap) {
+            if ((e = dbuf_put(text, r.data, r.datalen))) return e;
+        } else if (r.type == TL_DIFF) {
             uint8_t *nt = NULL; size_t ntl = 0; int applied = 0;
             int de = diff_apply_patch(text->data, text->len, r.data, r.datalen, &nt, &ntl, &applied);
-            if (de) { e = diff_err_to_bj(de); break; }
-            if (!applied) { free(nt); e = BJ_ERR_STATE; break; }
+            if (de) return diff_err_to_bj(de);
+            if (!applied) { free(nt); return BJ_ERR_STATE; }
             text->len = 0;
             e = dbuf_put(text, nt, ntl);
             free(nt);
-            if (e) break;
+            if (e) return e;
         }
     }
-    return e;
+    return BJ_OK;
 }
 
 /* ---- addVersion ----------------------------------------------------- */
 
-int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
-                        int64_t ts_ms, double *out_version) {
+static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
+                             int64_t ts_ms, uint64_t offset, uint8_t *out_type) {
     uint8_t hash[64];
     sha256_hex(text, text_len, hash);
 
     double new_version = t->version + 1;
     int should_snapshot = (t->diff_count >= t->diffs_per_snapshot) || !t->has_latest;
-    size_t offset = t->img.len;
     int e;
 
     if (should_snapshot) {
@@ -422,6 +453,7 @@ int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
         t->diff_count = 0;
         t->has_snapshot = 1;
         t->snapshot_ptr = (double)offset;
+        *out_type = TL_FULL_SNAPSHOT;
     } else {
         dbuf prev; memset(&prev, 0, sizeof(prev));
         e = reconstruct_version(t, t->version, &prev);
@@ -434,15 +466,41 @@ int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
         free(patch);
         if (e) return e;
         t->diff_count += 1;
+        *out_type = TL_DIFF;
     }
 
     t->has_latest = 1;
     t->latest_ptr = (double)offset;
     t->version = new_version;
+    return save_metadata(t);
+}
 
-    e = save_metadata(t);
+int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
+                        int64_t ts_ms, double *out_version) {
+    /* Snapshot rollback state; commit the whole entry + metadata with one
+     * host write, or leave the file (and this state) untouched on failure. */
+    double sv_version = t->version, sv_diff = t->diff_count;
+    double sv_sp = t->snapshot_ptr, sv_lp = t->latest_ptr;
+    int sv_hs = t->has_snapshot, sv_hl = t->has_latest;
+
+    int e = ents_reserve(t, t->n_ents + 1);
     if (e) return e;
-    if (out_version) *out_version = new_version;
+
+    uint64_t offset = bjfile_len(&t->f);
+    uint8_t type = 0;
+    e = add_version_inner(t, text, text_len, ts_ms, offset, &type);
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->version = sv_version; t->diff_count = sv_diff;
+        t->snapshot_ptr = sv_sp; t->latest_ptr = sv_lp;
+        t->has_snapshot = sv_hs; t->has_latest = sv_hl;
+        return e;
+    }
+
+    tl_ent ent = { offset, t->version, type };
+    t->ents[t->n_ents++] = ent;   /* capacity reserved above */
+    if (out_version) *out_version = t->version;
     return BJ_OK;
 }
 
@@ -459,21 +517,18 @@ int textlog_get_version(textlog *t, double version,
 
 int textlog_get_version_hash(textlog *t, double version,
                              const uint8_t **out_ptr, size_t *out_len) {
-    size_t off = 0;
-    while (off < t->img.len) {
-        size_t sz;
-        int e = bj_value_size(t->img.data, t->img.len, off, &sz);
+    for (int i = t->n_ents - 1; i >= 0; i--) {
+        if (t->ents[i].version != version) continue;
+        const uint8_t *rec; size_t rec_len;
+        int e = bjfile_read_record(&t->f, t->ents[i].off, &rec, &rec_len);
         if (e) return e;
         trec r;
-        e = parse_record(t->img.data, t->img.len, off, &r);
+        e = parse_record(rec, rec_len, &r);
         if (e) return e;
-        off += sz;
-        if (r.is_entry && r.version == version) {
-            e = set_out(t, r.hash, r.hashlen);
-            if (e) return e;
-            *out_ptr = t->out.data; *out_len = t->out.len;
-            return BJ_OK;
-        }
+        e = set_out(t, r.hash, r.hashlen);
+        if (e) return e;
+        *out_ptr = t->out.data; *out_len = t->out.len;
+        return BJ_OK;
     }
     return BJ_ERR_STATE; /* not found (host validates range, so unreachable) */
 }
@@ -502,65 +557,116 @@ int textlog_get_diff(textlog *t, double from_version, double to_version,
 
 /* ---- Lifecycle & accessors ------------------------------------------ */
 
-textlog *textlog_create(int diffs_per_snapshot) {
+textlog *textlog_create(const bj_io *io, int diffs_per_snapshot) {
     if (diffs_per_snapshot < 1) return NULL;
     textlog *t = (textlog *)calloc(1, sizeof(textlog));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
+    bjfile_init(&t->f, io);
     t->version = 0;
     t->diff_count = 0;
     t->diffs_per_snapshot = diffs_per_snapshot;
     t->has_snapshot = 0;
     t->has_latest = 0;
-    if (save_metadata(t)) { textlog_free(t); return NULL; }
+    if (bjfile_append_header(&t->f, t->bld, "textlog") ||
+        save_metadata(t) || bjfile_commit(&t->f)) {
+        textlog_free(t);
+        return NULL;
+    }
     return t;
 }
 
-textlog *textlog_load(const uint8_t *bytes, size_t len) {
+/*
+ * Commit-scan state: entries are indexed provisionally (trimmed back to the
+ * last good commit afterwards) and the last two metadata candidates are kept
+ * — at most one metadata record can sit in a rejected tail commit, so the
+ * one ending exactly at the last good offset is always among them. The
+ * pointer fields of a trec are unused for metadata, so a value copy is safe.
+ */
+typedef struct {
+    textlog *t;
+    trec     md[2];
+    uint64_t md_end[2];
+    int      n_md;
+} tl_scan;
+
+static int tl_scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
+                      size_t rec_len, int *is_commit_end) {
+    tl_scan *s = (tl_scan *)ctx;
+    trec r;
+    if (parse_record(rec, rec_len, &r)) return BJ_OK;  /* not an object: skip */
+    if (r.is_entry) {
+        if (ents_reserve(s->t, s->t->n_ents + 1)) return BJ_ERR_OOM;
+        tl_ent ent = { off, r.version, (uint8_t)r.type };
+        s->t->ents[s->t->n_ents++] = ent;
+    }
+    if (r.is_metadata && r.diffs_per_snapshot >= 1 && r.version >= 0) {
+        s->md[s->n_md & 1] = r;
+        s->md_end[s->n_md & 1] = off + rec_len;
+        s->n_md++;
+        *is_commit_end = 1;
+    }
+    return BJ_OK;
+}
+
+/*
+ * Open: verify the file identifies as a text log (when it carries a header;
+ * files from the JS reference have none and are accepted), then scan it once
+ * — indexing entry offsets and verifying every protected commit's CRC. A torn
+ * tail is truncated back to the last good commit; verifiable data beyond a
+ * damaged region refuses to open rather than silently truncating good
+ * commits away.
+ */
+textlog *textlog_open(const bj_io *io) {
     textlog *t = (textlog *)calloc(1, sizeof(textlog));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    if (len) {
-        t->img.data = (uint8_t *)malloc(len);
-        if (!t->img.data) { textlog_free(t); return NULL; }
-        memcpy(t->img.data, bytes, len);
-        t->img.len = len;
-        t->img.cap = len;
+    bjfile_init(&t->f, io);
+
+    if (bjfile_check_header(&t->f, "textlog") < 0) { textlog_free(t); return NULL; }
+
+    tl_scan s;
+    memset(&s, 0, sizeof(s));
+    s.t = t;
+    uint64_t good = 0, flen = bjfile_len(&t->f);
+    if (bjfile_scan_commits(&t->f, tl_scan_cb, &s, &good)) { textlog_free(t); return NULL; }
+
+    /* Adopt the metadata record that ends the last good commit. */
+    trec *adopt = NULL;
+    for (int i = 0; i < 2 && i < s.n_md; i++)
+        if (s.md_end[i] == good) adopt = &s.md[i];
+    if (!adopt ||
+        (adopt->has_snap && !(adopt->snap >= 0 && adopt->snap < (double)good)) ||
+        (adopt->has_latest && !(adopt->latest >= 0 && adopt->latest < (double)good)) ||
+        !(adopt->diff_count >= 0)) {
+        textlog_free(t);
+        return NULL;
     }
 
-    /* Find the last metadata record. */
-    int found = 0;
-    size_t off = 0;
-    while (off < t->img.len) {
-        size_t sz;
-        if (bj_value_size(t->img.data, t->img.len, off, &sz)) break;
-        trec r;
-        if (parse_record(t->img.data, t->img.len, off, &r)) break;
-        off += sz;
-        if (r.is_metadata) {
-            t->version = r.version;
-            t->has_snapshot = r.has_snap; t->snapshot_ptr = r.snap;
-            t->has_latest = r.has_latest; t->latest_ptr = r.latest;
-            t->diff_count = r.diff_count;
-            t->diffs_per_snapshot = r.diffs_per_snapshot;
-            found = 1;
-        }
-    }
-    if (!found) { textlog_free(t); return NULL; }
+    /* Drop provisionally indexed entries from a rejected tail commit. */
+    while (t->n_ents && t->ents[t->n_ents - 1].off >= good) t->n_ents--;
+
+    t->version = adopt->version;
+    t->has_snapshot = adopt->has_snap; t->snapshot_ptr = adopt->snap;
+    t->has_latest = adopt->has_latest; t->latest_ptr = adopt->latest;
+    t->diff_count = adopt->diff_count;
+    t->diffs_per_snapshot = adopt->diffs_per_snapshot;
+
+    if (good < flen && bjfile_set_len(&t->f, good)) { textlog_free(t); return NULL; }
     return t;
 }
 
 void textlog_free(textlog *t) {
     if (!t) return;
     bj_builder_free(t->bld);
-    free(t->img.data);
+    bjfile_dispose(&t->f);
     free(t->out.data);
+    free(t->ents);
     free(t);
 }
 
 double         textlog_version(const textlog *t)            { return t->version; }
 int            textlog_diffs_per_snapshot(const textlog *t) { return t->diffs_per_snapshot; }
-const uint8_t *textlog_image(const textlog *t, size_t *len) { if (len) *len = t->img.len; return t->img.data; }
 const uint8_t *textlog_out(const textlog *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }

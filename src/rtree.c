@@ -2,11 +2,16 @@
  * rtree.c — C port of src/rtree.js. See rtree.h.
  *
  * The tree is persistent, append-only and immutable: every mutation appends new
- * nodes (and fresh metadata) to the in-memory file image and re-points the root,
+ * nodes (and fresh metadata) to the backing file and re-points the root,
  * exactly like the reference. Nodes/metadata use the binjson wire format from
  * binjson.c so the on-disk bytes match the JS implementation.
+ *
+ * All file access goes through bjfile (bjfile.h): reads fetch one record at a
+ * time, and each mutating operation's appends are committed with a single host
+ * write when the operation succeeds (or dropped whole when it fails).
  */
 #include "rtree.h"
+#include "bjfile.h"
 #include "geo.h"
 
 #include <stdlib.h>
@@ -85,7 +90,7 @@ static int dbuf_append(dbuf *b, const uint8_t *p, size_t n, double *off) {
 }
 
 struct rtree {
-    dbuf        img;         /* file image                     */
+    bjfile      f;           /* backing file                   */
     dbuf        out;         /* last op output                 */
     bj_builder *bld;         /* reused for node/metadata saves */
     double      root;
@@ -94,6 +99,15 @@ struct rtree {
     int         max_entries;
     int         min_entries;
 };
+
+/* bjfile_append with the double-typed offsets the tree carries. */
+static int bjf_append(bjfile *dst, const uint8_t *b, size_t n, double *off) {
+    uint64_t o;
+    int e = bjfile_append(dst, b, n, &o);
+    if (e) return e;
+    if (off) *off = (double)o;
+    return BJ_OK;
+}
 
 static int set_out(rtree *t, const uint8_t *b, size_t n) {
     t->out.len = 0;
@@ -259,12 +273,13 @@ static void node_free(rnode *n) {
     node_init(n);
 }
 
-/* Decode the node object stored at `offset` in the image into `out`. */
+/* Decode the node object stored at `offset` in the file into `out`. */
 static int parse_node(rtree *t, double offset, rnode *out) {
     node_init(out);
-    size_t off = (size_t)offset;
-    if (off > t->img.len) return BJ_ERR_EOF;
-    cur c = { t->img.data + off, t->img.len - off, 0 };
+    const uint8_t *rec; size_t rec_len;
+    int err = bjfile_read_record(&t->f, (uint64_t)offset, &rec, &rec_len);
+    if (err) return err;
+    cur c = { rec, rec_len, 0 };
 
     uint32_t count;
     int e = object_begin(&c, &count);
@@ -342,7 +357,7 @@ static void emit_entry(bj_builder *b, const rentry *en) {
 }
 
 /* Encode `nd` and append it to `dst`; return its offset via *off. */
-static int encode_node(rtree *t, const rnode *nd, dbuf *dst, double *off) {
+static int encode_node(rtree *t, const rnode *nd, bjfile *dst, double *off) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
@@ -364,17 +379,17 @@ static int encode_node(rtree *t, const rnode *nd, dbuf *dst, double *off) {
     size_t len;
     const uint8_t *d = bj_builder_data(b, &len);
     if (!d) return BJ_ERR_STATE;
-    return dbuf_append(dst, d, len, off);
+    return bjf_append(dst, d, len, off);
 }
 
-/* Append `nd` to the tree's live image. */
+/* Append `nd` to the tree's live file. */
 static int save_node(rtree *t, const rnode *nd, double *off) {
-    return encode_node(t, nd, &t->img, off);
+    return encode_node(t, nd, &t->f, off);
 }
 
 /* ---- Metadata ------------------------------------------------------- */
 
-static int encode_metadata(rtree *t, dbuf *dst, double root) {
+static int encode_metadata(rtree *t, bjfile *dst, double root) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
@@ -391,30 +406,56 @@ static int encode_metadata(rtree *t, dbuf *dst, double root) {
     size_t len;
     const uint8_t *d = bj_builder_data(b, &len);
     if (!d) return BJ_ERR_STATE;
-    double off;
-    return dbuf_append(dst, d, len, &off);
+    /* Metadata ends every commit; a CRC trailer written just before it covers
+     * all of the operation's appended bytes (bjfile_append_protected). */
+    return bjfile_append_protected(dst, d, len);
 }
-static int save_metadata(rtree *t) { return encode_metadata(t, &t->img, t->root); }
+static int save_metadata(rtree *t) { return encode_metadata(t, &t->f, t->root); }
 
-static int parse_metadata(rtree *t) {
-    if (t->img.len < RT_METADATA_SIZE) return BJ_ERR_EOF;
-    cur c = { t->img.data + (t->img.len - RT_METADATA_SIZE), RT_METADATA_SIZE, 0 };
+typedef struct {
+    double root, next_id, size;
+    int    max_entries, min_entries;
+    int    have_root;
+} rt_meta;
+
+/* Parse a metadata record's fields out of its bytes. */
+static int parse_meta_rec(const uint8_t *rec, size_t rec_len, rt_meta *m) {
+    memset(m, 0, sizeof(*m));
+    cur c = { rec, rec_len, 0 };
     uint32_t count;
     int e = object_begin(&c, &count);
     if (e) return e;
-    int have_root = 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kn; uint32_t klen;
         if ((e = take_key(&c, &kn, &klen))) return e;
         double d;
-        if      (name_eq(kn, klen, "maxEntries")) { if ((e = read_number(&c, &d))) return e; t->max_entries = (int)d; }
-        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; t->min_entries = (int)d; }
-        else if (name_eq(kn, klen, "size"))       { if ((e = read_number(&c, &t->size))) return e; }
-        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_number(&c, &t->next_id))) return e; }
-        else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &t->root))) return e; have_root = 1; }
+        if      (name_eq(kn, klen, "maxEntries")) { if ((e = read_number(&c, &d))) return e; m->max_entries = (int)d; }
+        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; m->min_entries = (int)d; }
+        else if (name_eq(kn, klen, "size"))       { if ((e = read_number(&c, &m->size))) return e; }
+        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_number(&c, &m->next_id))) return e; }
+        else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
         else                                      { if ((e = skip_value(&c))) return e; }
     }
-    return have_root ? BJ_OK : BJ_ERR_STATE;
+    return m->have_root ? BJ_OK : BJ_ERR_STATE;
+}
+
+/* Range-check metadata fields. `before` is the metadata record's own offset:
+ * the root it points at must lie strictly before it. */
+static int meta_valid(const rt_meta *m, uint64_t before) {
+    if (m->max_entries < 2) return 0;
+    if (m->min_entries < 1 || m->min_entries > m->max_entries) return 0;
+    if (!(m->size >= 0)) return 0;
+    if (!(m->next_id >= 0)) return 0;
+    if (!(m->root >= 0) || m->root >= (double)before) return 0;
+    return 1;
+}
+
+static void meta_apply(rtree *t, const rt_meta *m) {
+    t->max_entries = m->max_entries;
+    t->min_entries = m->min_entries;
+    t->size = m->size;
+    t->next_id = m->next_id;
+    t->root = m->root;
 }
 
 /* ---- Node construction & bbox --------------------------------------- */
@@ -619,7 +660,7 @@ static int insert_node(rtree *t, double ptr, const rentry *entry, ins_res *out) 
     return e;
 }
 
-int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12) {
+static int insert_root(rtree *t, double lat, double lng, const uint8_t *oid12) {
     rentry entry;
     memset(&entry, 0, sizeof(entry));
     entry.bbox.valid = 1;
@@ -646,6 +687,22 @@ int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12) {
     }
     t->size += 1;
     return save_metadata(t);
+}
+
+/*
+ * Public mutating operations commit all of the operation's appended records
+ * with a single host write; on any failure the pending bytes are dropped and
+ * the in-memory state is rolled back, leaving the file untouched.
+ */
+int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12) {
+    double root = t->root, next_id = t->next_id, size = t->size;
+    int e = insert_root(t, lat, lng, oid12);
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->root = root; t->next_id = next_id; t->size = size;
+    }
+    return e;
 }
 
 /* ---- Remove (mirrors _remove / _handleUnderflow / remove) ----------- */
@@ -835,7 +892,7 @@ static int remove_node(rtree *t, double ptr, const uint8_t *oid, del_res *out) {
     return BJ_OK;
 }
 
-int rtree_remove(rtree *t, const uint8_t *oid12, int *removed) {
+static int remove_root(rtree *t, const uint8_t *oid12, int *removed) {
     del_res res;
     int e = remove_node(t, t->root, oid12, &res);
     if (e) return e;
@@ -853,18 +910,38 @@ int rtree_remove(rtree *t, const uint8_t *oid12, int *removed) {
     return save_metadata(t);
 }
 
+int rtree_remove(rtree *t, const uint8_t *oid12, int *removed) {
+    double root = t->root, next_id = t->next_id, size = t->size;
+    int e = remove_root(t, oid12, removed);
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->root = root; t->next_id = next_id; t->size = size;
+    }
+    return e;
+}
+
 /* ---- Clear ---------------------------------------------------------- */
 
 int rtree_clear(rtree *t) {
+    double sv_root = t->root, next_id = t->next_id, size = t->size;
     rnode root;
     int e = make_leaf(&root, t->next_id++, NULL, 0);
-    if (e) return e;
-    root.bbox.valid = 0;
-    e = save_node(t, &root, &t->root);
-    node_free(&root);
-    if (e) return e;
-    t->size = 0;
-    return save_metadata(t);
+    if (!e) {
+        root.bbox.valid = 0;
+        e = save_node(t, &root, &t->root);
+        node_free(&root);
+    }
+    if (!e) {
+        t->size = 0;
+        e = save_metadata(t);
+    }
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->root = sv_root; t->next_id = next_id; t->size = size;
+    }
+    return e;
 }
 
 /* ---- Search --------------------------------------------------------- */
@@ -986,7 +1063,7 @@ static int ptrmap_put(ptrmap *m, double old, double neu) {
     return BJ_OK;
 }
 
-static int clone_node(rtree *t, dbuf *dst, ptrmap *m, double old_off, double *new_off) {
+static int clone_node(rtree *t, bjfile *dst, ptrmap *m, double old_off, double *new_off) {
     if (ptrmap_get(m, old_off, new_off)) return BJ_OK;
     rnode nd;
     int e = parse_node(t, old_off, &nd);
@@ -1005,18 +1082,19 @@ static int clone_node(rtree *t, dbuf *dst, ptrmap *m, double old_off, double *ne
     return ptrmap_put(m, old_off, *new_off);
 }
 
-int rtree_compact(rtree *t, const uint8_t **out_ptr, size_t *out_len) {
-    dbuf dst; memset(&dst, 0, sizeof(dst));
+int rtree_compact(rtree *t, const bj_io *dst_io) {
+    bjfile dst;
+    bjfile_init(&dst, dst_io);
+    dst.autoflush = 1u << 18;   /* stream to the host in ~256 KB chunks */
     ptrmap m; memset(&m, 0, sizeof(m));
     double new_root = 0;
-    int e = clone_node(t, &dst, &m, t->root, &new_root);
+    int e = bjfile_append_header(&dst, t->bld, "rtree");
+    if (!e) e = clone_node(t, &dst, &m, t->root, &new_root);
     if (!e) e = encode_metadata(t, &dst, new_root);
-    if (!e) e = set_out(t, dst.data, dst.len);
-    free(dst.data);
+    if (!e) e = bjfile_commit(&dst);
     free(m.olds); free(m.news);
-    if (e) return e;
-    *out_ptr = t->out.data; *out_len = t->out.len;
-    return BJ_OK;
+    bjfile_dispose(&dst);
+    return e;
 }
 
 /* ---- Lifecycle & accessors ------------------------------------------ */
@@ -1026,50 +1104,93 @@ static int min_entries_for(int max_entries) {
     return half < 2 ? 2 : half;
 }
 
-rtree *rtree_create(int max_entries) {
+rtree *rtree_create(const bj_io *io, int max_entries) {
     if (max_entries < 2) return NULL;
     rtree *t = (rtree *)calloc(1, sizeof(rtree));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
+    bjfile_init(&t->f, io);
     t->max_entries = max_entries;
     t->min_entries = min_entries_for(max_entries);
     t->next_id = 1;
     t->size = 0;
 
+    if (bjfile_append_header(&t->f, t->bld, "rtree")) { rtree_free(t); return NULL; }
     rnode root;
     if (make_leaf(&root, 0, NULL, 0)) { rtree_free(t); return NULL; }
     root.bbox.valid = 0;
     if (save_node(t, &root, &t->root)) { node_free(&root); rtree_free(t); return NULL; }
     node_free(&root);
-    if (save_metadata(t)) { rtree_free(t); return NULL; }
+    if (save_metadata(t) || bjfile_commit(&t->f)) { rtree_free(t); return NULL; }
     return t;
 }
 
-rtree *rtree_load(const uint8_t *bytes, size_t len) {
-    if (len < RT_METADATA_SIZE) return NULL;
+/* Commit-scan callback: a commit ends at each record that parses and
+ * validates as a metadata record of the fixed on-wire size. */
+static int scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
+                   size_t rec_len, int *is_commit_end) {
+    (void)ctx;
+    if (rec_len == RT_METADATA_SIZE) {
+        rt_meta m;
+        if (parse_meta_rec(rec, rec_len, &m) == BJ_OK && meta_valid(&m, off))
+            *is_commit_end = 1;
+    }
+    return BJ_OK;
+}
+
+/*
+ * Open: verify the file identifies as an R-tree (when it carries a header;
+ * files from the JS reference have none and are accepted), then take the fast
+ * path — parse + validate the metadata at the fixed tail offset and verify
+ * the last commit's CRC. Any failure falls back to a full recovery scan
+ * (torn tails are truncated to the last good commit; verifiable data beyond
+ * a damaged region refuses to open). Mirrors bpt_open.
+ */
+rtree *rtree_open(const bj_io *io) {
     rtree *t = (rtree *)calloc(1, sizeof(rtree));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    t->img.data = (uint8_t *)malloc(len);
-    if (!t->img.data) { rtree_free(t); return NULL; }
-    memcpy(t->img.data, bytes, len);
-    t->img.len = len;
-    t->img.cap = len;
-    if (parse_metadata(t)) { rtree_free(t); return NULL; }
+    bjfile_init(&t->f, io);
+
+    if (bjfile_check_header(&t->f, "rtree") < 0) { rtree_free(t); return NULL; }
+
+    const uint8_t *md; size_t md_len;
+    rt_meta m;
+    uint64_t flen = bjfile_len(&t->f);
+    if (bjfile_check_tail(&t->f, RT_METADATA_SIZE, &md, &md_len) == BJ_OK &&
+        parse_meta_rec(md, md_len, &m) == BJ_OK &&
+        meta_valid(&m, flen - RT_METADATA_SIZE)) {
+        meta_apply(t, &m);
+        return t;
+    }
+
+    /* Recovery. */
+    uint64_t good = 0;
+    if (bjfile_scan_commits(&t->f, scan_cb, NULL, &good)) { rtree_free(t); return NULL; }
+    if (good < RT_METADATA_SIZE) { rtree_free(t); return NULL; }
+    const uint8_t *rec; size_t rec_len;
+    if (bjfile_read_record(&t->f, good - RT_METADATA_SIZE, &rec, &rec_len) ||
+        rec_len != RT_METADATA_SIZE ||
+        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
+        !meta_valid(&m, good - RT_METADATA_SIZE)) {
+        rtree_free(t);
+        return NULL;
+    }
+    if (good < flen && bjfile_set_len(&t->f, good)) { rtree_free(t); return NULL; }
+    meta_apply(t, &m);
     return t;
 }
 
 void rtree_free(rtree *t) {
     if (!t) return;
     bj_builder_free(t->bld);
-    free(t->img.data);
+    bjfile_dispose(&t->f);
     free(t->out.data);
     free(t);
 }
 
 double         rtree_size(const rtree *t)        { return t->size; }
 int            rtree_max_entries(const rtree *t) { return t->max_entries; }
-const uint8_t *rtree_image(const rtree *t, size_t *len) { if (len) *len = t->img.len; return t->img.data; }
 const uint8_t *rtree_out(const rtree *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }

@@ -3,10 +3,11 @@
  * src/rtree.js.
  *
  * Design (mirrors bplustree.h / bplustree.c):
- *   - A tree owns an in-memory byte "image" mirroring the append-only file:
- *     nodes and metadata are appended verbatim, and reads resolve by offset into
- *     the image. The host (JS) loads the existing file bytes on open and writes
- *     the image back to storage on flush/close — no per-node host callbacks.
+ *   - The tree is file-resident: nodes and metadata are read from and appended
+ *     to the backing file through the bj_io callbacks (bjio.h) supplied at
+ *     create/open. No copy of the file is kept in memory — reads fetch one
+ *     record at a time and each mutation appends its new nodes plus fresh
+ *     metadata with a single write, exactly like src/rtree.js.
  *   - Nodes and metadata use the exact binjson wire format of rtree.js, so files
  *     stay byte-compatible (bin/rtree-decode.js can read them).
  *   - Spatial entries carry a point (lat/lng) and a 12-byte ObjectId. Bounding
@@ -27,6 +28,7 @@
 #include <stddef.h>
 
 #include "binjson.h"
+#include "bjio.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,20 +36,19 @@ extern "C" {
 
 typedef struct rtree rtree;
 
-/* Create a fresh empty tree (maxEntries >= 2). Returns NULL on OOM. */
-rtree *rtree_create(int max_entries);
-/* Load an existing tree from a file image (copies `len` bytes). Returns NULL on
- * OOM or if the image is too small / metadata is unreadable. */
-rtree *rtree_load(const uint8_t *bytes, size_t len);
-/* Free a tree and all its buffers. Safe to pass NULL. */
+/* Create a fresh empty tree (maxEntries >= 2) on `io` (expected empty) and
+ * write the initial root + metadata. Returns NULL on OOM or write failure. */
+rtree *rtree_create(const bj_io *io, int max_entries);
+/* Open an existing tree from `io`. Returns NULL on OOM or if the file is too
+ * small / metadata is unreadable. */
+rtree *rtree_open(const bj_io *io);
+/* Free a tree and all its buffers (does not touch the file). Safe on NULL. */
 void rtree_free(rtree *t);
 
 /* Accessors (mirror the JS metadata fields). */
 double         rtree_size(const rtree *t);
 int            rtree_max_entries(const rtree *t);
-/* The full file image; writes its length through *len. */
-const uint8_t *rtree_image(const rtree *t, size_t *len);
-/* The last search / compact output; writes its length through *len. */
+/* The last search output; writes its length through *len. */
 const uint8_t *rtree_out(const rtree *t, size_t *len);
 
 /* Insert a point (lat, lng) with a 12-byte ObjectId. */
@@ -75,10 +76,11 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
                         const uint8_t **out_ptr, size_t *out_len);
 
 /*
- * Rewrite the reachable nodes into a fresh, compacted image (dropping stale
- * append-only history). Exposes the new image bytes via out_ptr/out_len.
+ * Rewrite the reachable nodes (dropping stale append-only history) into the
+ * destination file `dst`, which is expected to be empty. Records are streamed
+ * to the host in chunks; nothing is retained in memory.
  */
-int rtree_compact(rtree *t, const uint8_t **out_ptr, size_t *out_len);
+int rtree_compact(rtree *t, const bj_io *dst);
 
 #ifdef __cplusplus
 }

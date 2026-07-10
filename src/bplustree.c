@@ -2,11 +2,16 @@
  * bplustree.c — C port of src/bplustree.js. See bplustree.h.
  *
  * The tree is persistent, append-only and immutable: every mutation appends new
- * nodes (and fresh metadata) to the in-memory file image and re-points the root,
+ * nodes (and fresh metadata) to the backing file and re-points the root,
  * exactly like the reference. Nodes/metadata use the binjson wire format from
  * binjson.c so the on-disk bytes match the JS implementation.
+ *
+ * All file access goes through bjfile (bjfile.h): reads fetch one record at a
+ * time, and each mutating operation's appends are committed with a single host
+ * write when the operation succeeds (or dropped whole when it fails).
  */
 #include "bplustree.h"
+#include "bjfile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +39,7 @@ typedef struct {
 } bpt_node;
 
 struct bpt {
-    uint8_t   *img; size_t img_len; size_t img_cap;   /* file image        */
+    bjfile     f;                                     /* backing file      */
     uint8_t   *out; size_t out_len; size_t out_cap;   /* last op output    */
     bj_builder *bld;                                  /* reused for saves  */
     double     root;
@@ -168,23 +173,13 @@ static int node_build_internal(bpt_node *out, double id, const bpt_key *keys,
     return BJ_OK;
 }
 
-/* ---- Image buffer & output buffer ----------------------------------- */
+/* ---- File append & output buffer ------------------------------------ */
 
-static int img_ensure(bpt *t, size_t extra) {
-    if (t->img_len + extra <= t->img_cap) return BJ_OK;
-    size_t nc = t->img_cap ? t->img_cap : 256;
-    while (nc < t->img_len + extra) nc *= 2;
-    uint8_t *nb = (uint8_t *)realloc(t->img, nc);
-    if (!nb) return BJ_ERR_OOM;
-    t->img = nb; t->img_cap = nc;
-    return BJ_OK;
-}
-static int img_append(bpt *t, const uint8_t *b, size_t n, double *off) {
-    int e = img_ensure(t, n);
+static int file_append(bpt *t, const uint8_t *b, size_t n, double *off) {
+    uint64_t o;
+    int e = bjfile_append(&t->f, b, n, &o);
     if (e) return e;
-    if (off) *off = (double)t->img_len;
-    memcpy(t->img + t->img_len, b, n);
-    t->img_len += n;
+    if (off) *off = (double)o;
     return BJ_OK;
 }
 static int set_out(bpt *t, const uint8_t *b, size_t n) {
@@ -294,12 +289,13 @@ static int skip_value(cur *c) {
 
 /* ---- Node (de)serialization ----------------------------------------- */
 
-/* Decode the node object stored at `offset` in the image into `out`. */
+/* Decode the node object stored at `offset` in the file into `out`. */
 static int parse_node(bpt *t, double offset, bpt_node *out) {
     node_init(out);
-    size_t off = (size_t)offset;
-    if (off > t->img_len) return BJ_ERR_EOF;
-    cur c = { t->img + off, t->img_len - off, 0 };
+    const uint8_t *rec; size_t rec_len;
+    int err = bjfile_read_record(&t->f, (uint64_t)offset, &rec, &rec_len);
+    if (err) return err;
+    cur c = { rec, rec_len, 0 };
 
     uint8_t type;
     if (take_type(&c, &type) || type != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
@@ -408,7 +404,7 @@ static int save_node(bpt *t, const bpt_node *nd, double *off) {
     size_t len;
     const uint8_t *d = bj_builder_data(b, &len);
     if (!d) return BJ_ERR_STATE;
-    return img_append(t, d, len, off);
+    return file_append(t, d, len, off);
 }
 
 /* ---- Metadata ------------------------------------------------------- */
@@ -430,20 +426,27 @@ static int save_metadata(bpt *t) {
     size_t len;
     const uint8_t *d = bj_builder_data(b, &len);
     if (!d) return BJ_ERR_STATE;
-    double off;
-    return img_append(t, d, len, &off);
+    /* Metadata ends every commit; a CRC trailer written just before it covers
+     * all of the operation's appended bytes (bjfile_append_protected). */
+    return bjfile_append_protected(&t->f, d, len);
 }
 
-static int parse_metadata(bpt *t) {
-    if (t->img_len < BPT_METADATA_SIZE) return BJ_ERR_EOF;
-    cur c = { t->img + (t->img_len - BPT_METADATA_SIZE), BPT_METADATA_SIZE, 0 };
+typedef struct {
+    double root, next_id, size;
+    int    order, min_keys;
+    int    have_root;
+} bpt_meta;
+
+/* Parse a metadata record's fields out of its bytes. */
+static int parse_meta_rec(const uint8_t *rec, size_t rec_len, bpt_meta *m) {
+    memset(m, 0, sizeof(*m));
+    cur c = { rec, rec_len, 0 };
     uint8_t type;
     if (take_type(&c, &type) || type != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
     uint32_t size, count;
     if (take_u32(&c, &size)) return BJ_ERR_EOF;
     if (take_u32(&c, &count)) return BJ_ERR_EOF;
 
-    int have_root = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t klen;
         if (take_u32(&c, &klen)) return BJ_ERR_EOF;
@@ -452,14 +455,33 @@ static int parse_metadata(bpt *t) {
         c.pos += klen;
         int e = BJ_OK;
         double d;
-        if (name_eq(kn, klen, "maxEntries"))      { if ((e = read_number(&c, &d))) return e; t->order = (int)d; }
-        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; t->min_keys = (int)d; }
-        else if (name_eq(kn, klen, "size"))       { if ((e = read_number(&c, &t->size))) return e; }
-        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_number(&c, &t->next_id))) return e; }
-        else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &t->root))) return e; have_root = 1; }
+        if (name_eq(kn, klen, "maxEntries"))      { if ((e = read_number(&c, &d))) return e; m->order = (int)d; }
+        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; m->min_keys = (int)d; }
+        else if (name_eq(kn, klen, "size"))       { if ((e = read_number(&c, &m->size))) return e; }
+        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_number(&c, &m->next_id))) return e; }
+        else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
         else                                      { if ((e = skip_value(&c))) return e; }
     }
-    return have_root ? BJ_OK : BJ_ERR_STATE;
+    return m->have_root ? BJ_OK : BJ_ERR_STATE;
+}
+
+/* Range-check metadata fields. `before` is the metadata record's own offset:
+ * the root it points at must lie strictly before it. */
+static int meta_valid(const bpt_meta *m, uint64_t before) {
+    if (m->order < 3) return 0;
+    if (m->min_keys < 1 || m->min_keys >= m->order) return 0;
+    if (!(m->size >= 0)) return 0;
+    if (!(m->next_id >= 0)) return 0;
+    if (!(m->root >= 0) || m->root >= (double)before) return 0;
+    return 1;
+}
+
+static void meta_apply(bpt *t, const bpt_meta *m) {
+    t->order = m->order;
+    t->min_keys = m->min_keys;
+    t->size = m->size;
+    t->next_id = m->next_id;
+    t->root = m->root;
 }
 
 /* ---- Insert (mirrors _addToNode / add in bplustree.js) -------------- */
@@ -584,7 +606,7 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
     return e;
 }
 
-int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
+static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
     add_res res;
     int e = add_node(t, t->root, key, val, vlen, &res);
     if (e) return e;
@@ -612,6 +634,22 @@ int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
     /* Updating an existing key leaves the number of distinct keys unchanged. */
     if (!res.updated) t->size += 1;
     return save_metadata(t);
+}
+
+/*
+ * Public mutating operations commit all of the operation's appended records
+ * with a single host write; on any failure the pending bytes are dropped and
+ * the in-memory state is rolled back, leaving the file untouched.
+ */
+int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
+    double root = t->root, next_id = t->next_id, size = t->size;
+    int e = add_root(t, key, val, vlen);
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->root = root; t->next_id = next_id; t->size = size;
+    }
+    return e;
 }
 
 /* ---- Delete (mirrors _deleteFromNode / delete) ---------------------- */
@@ -667,7 +705,7 @@ static int del_node(bpt *t, double ptr, const bpt_key *key, del_res *out) {
     return e;
 }
 
-int bpt_delete(bpt *t, const bpt_key *key) {
+static int delete_root(bpt *t, const bpt_key *key) {
     del_res res;
     int e = del_node(t, t->root, key, &res);
     if (e) return e;
@@ -689,6 +727,17 @@ int bpt_delete(bpt *t, const bpt_key *key) {
     t->root = rootp;
     t->size -= 1;
     return save_metadata(t);
+}
+
+int bpt_delete(bpt *t, const bpt_key *key) {
+    double root = t->root, next_id = t->next_id, size = t->size;
+    int e = delete_root(t, key);
+    if (!e) e = bjfile_commit(&t->f);
+    if (e) {
+        bjfile_discard(&t->f);
+        t->root = root; t->next_id = next_id; t->size = size;
+    }
+    return e;
 }
 
 /* ---- Search / traversal --------------------------------------------- */
@@ -791,14 +840,17 @@ int bpt_height(bpt *t, int *out_height) {
 
 /* ---- Lifecycle & accessors ------------------------------------------ */
 
-bpt *bpt_create(int order) {
+bpt *bpt_create(const bj_io *io, int order) {
+    if (order < 3) return NULL;
     bpt *t = (bpt *)calloc(1, sizeof(bpt));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
+    bjfile_init(&t->f, io);
     t->order = order;
     t->min_keys = (order + 1) / 2 - 1;   /* ceil(order/2) - 1 */
 
+    if (bjfile_append_header(&t->f, t->bld, "bplustree")) { bpt_free(t); return NULL; }
     bpt_node root;
     if (node_build_leaf(&root, 0, NULL, NULL, 0, 0, 0)) { node_free(&root); bpt_free(t); return NULL; }
     t->next_id = 1;
@@ -807,29 +859,72 @@ bpt *bpt_create(int order) {
     if (save_node(t, &root, &rp)) { node_free(&root); bpt_free(t); return NULL; }
     node_free(&root);
     t->root = rp;
-    if (save_metadata(t)) { bpt_free(t); return NULL; }
+    if (save_metadata(t) || bjfile_commit(&t->f)) { bpt_free(t); return NULL; }
     return t;
 }
 
-bpt *bpt_load(const uint8_t *bytes, size_t len) {
-    if (len < BPT_METADATA_SIZE) return NULL;
+/* Commit-scan callback: a commit ends at each record that parses and
+ * validates as a metadata record of the fixed on-wire size. */
+static int scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
+                   size_t rec_len, int *is_commit_end) {
+    (void)ctx;
+    if (rec_len == BPT_METADATA_SIZE) {
+        bpt_meta m;
+        if (parse_meta_rec(rec, rec_len, &m) == BJ_OK && meta_valid(&m, off))
+            *is_commit_end = 1;
+    }
+    return BJ_OK;
+}
+
+/*
+ * Open: verify the file identifies as a B+ tree (when it carries a header;
+ * files from the JS reference have none and are accepted), then take the fast
+ * path — parse + validate the metadata at the fixed tail offset and verify
+ * the last commit's CRC. Any failure falls back to a full recovery scan that
+ * verifies every protected commit: a torn tail is truncated back to the last
+ * good commit; verifiable data beyond a damaged region refuses to open rather
+ * than silently truncating good commits away.
+ */
+bpt *bpt_open(const bj_io *io) {
     bpt *t = (bpt *)calloc(1, sizeof(bpt));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    t->img = (uint8_t *)malloc(len);
-    if (!t->img) { bpt_free(t); return NULL; }
-    memcpy(t->img, bytes, len);
-    t->img_len = len;
-    t->img_cap = len;
-    if (parse_metadata(t)) { bpt_free(t); return NULL; }
+    bjfile_init(&t->f, io);
+
+    if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
+
+    const uint8_t *md; size_t md_len;
+    bpt_meta m;
+    uint64_t flen = bjfile_len(&t->f);
+    if (bjfile_check_tail(&t->f, BPT_METADATA_SIZE, &md, &md_len) == BJ_OK &&
+        parse_meta_rec(md, md_len, &m) == BJ_OK &&
+        meta_valid(&m, flen - BPT_METADATA_SIZE)) {
+        meta_apply(t, &m);
+        return t;
+    }
+
+    /* Recovery. */
+    uint64_t good = 0;
+    if (bjfile_scan_commits(&t->f, scan_cb, NULL, &good)) { bpt_free(t); return NULL; }
+    if (good < BPT_METADATA_SIZE) { bpt_free(t); return NULL; }
+    const uint8_t *rec; size_t rec_len;
+    if (bjfile_read_record(&t->f, good - BPT_METADATA_SIZE, &rec, &rec_len) ||
+        rec_len != BPT_METADATA_SIZE ||
+        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
+        !meta_valid(&m, good - BPT_METADATA_SIZE)) {
+        bpt_free(t);
+        return NULL;
+    }
+    if (good < flen && bjfile_set_len(&t->f, good)) { bpt_free(t); return NULL; }
+    meta_apply(t, &m);
     return t;
 }
 
 void bpt_free(bpt *t) {
     if (!t) return;
     bj_builder_free(t->bld);
-    free(t->img);
+    bjfile_dispose(&t->f);
     free(t->out);
     free(t);
 }
@@ -838,4 +933,3 @@ double         bpt_size(const bpt *t)     { return t->size; }
 double         bpt_root(const bpt *t)     { return t->root; }
 double         bpt_next_id(const bpt *t)  { return t->next_id; }
 int            bpt_order(const bpt *t)    { return t->order; }
-const uint8_t *bpt_image(const bpt *t, size_t *len) { if (len) *len = t->img_len; return t->img; }
