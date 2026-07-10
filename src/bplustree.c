@@ -853,6 +853,163 @@ int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
     return collect_to_out(t, 1, min, max, out_ptr, out_len);
 }
 
+/* ---- Cursors --------------------------------------------------------- */
+
+typedef struct {
+    bpt_node node;   /* parsed internal node (owned by the cursor) */
+    int      idx;    /* next child index to visit                  */
+} cur_frame;
+
+struct bpt_cursor {
+    bpt      *t;
+    cur_frame stack[BPT_MAX_DEPTH + 1];
+    int       depth;
+    bpt_node  leaf;
+    int       has_leaf;
+    int       leaf_pos;
+    bpt_key   min, max;
+    int       has_min, has_max;
+    int       done;
+};
+
+/*
+ * Descend from `ptr` to a leaf, pushing the internal nodes visited onto the
+ * stack. With `seek_min`, the descent follows the child that may contain the
+ * cursor's lower bound (same equal-keys-route-right rule as bpt_search) and
+ * positions the leaf at the first key >= min; otherwise it goes leftmost.
+ */
+static int cursor_descend(bpt_cursor *c, double ptr, int seek_min) {
+    for (;;) {
+        if (c->depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
+        bpt_node nd;
+        int e = parse_node(c->t, ptr, &nd);
+        if (e) return e;
+        if (nd.is_leaf) {
+            c->leaf = nd;   /* take ownership */
+            c->has_leaf = 1;
+            c->leaf_pos = 0;
+            if (seek_min && c->has_min) {
+                while (c->leaf_pos < c->leaf.n_keys &&
+                       key_cmp(&c->leaf.keys[c->leaf_pos], &c->min) < 0)
+                    c->leaf_pos++;
+            }
+            return BJ_OK;
+        }
+        if (nd.n_children <= 0) { node_free(&nd); return BJ_ERR_STATE; }
+        int lo = 0;
+        if (seek_min && c->has_min) {
+            while (lo < nd.n_keys && key_cmp(&c->min, &nd.keys[lo]) >= 0) lo++;
+            if (lo >= nd.n_children) lo = nd.n_children - 1;
+        }
+        double child = nd.children[lo];
+        c->stack[c->depth].node = nd;   /* take ownership */
+        c->stack[c->depth].idx = lo + 1;
+        c->depth++;
+        ptr = child;
+    }
+}
+
+bpt_cursor *bpt_cursor_open(bpt *t, const bpt_key *min, const bpt_key *max) {
+    bpt_cursor *c = (bpt_cursor *)calloc(1, sizeof(bpt_cursor));
+    if (!c) return NULL;
+    c->t = t;
+    if (min) {
+        if (key_copy(&c->min, min)) { free(c); return NULL; }
+        c->has_min = 1;
+    }
+    if (max) {
+        if (key_copy(&c->max, max)) { key_free(&c->min); free(c); return NULL; }
+        c->has_max = 1;
+    }
+    /* Pin the current root: the cursor iterates this snapshot regardless of
+     * later mutations (append-only nodes are never overwritten). */
+    if (cursor_descend(c, t->root, 1)) { bpt_cursor_close(c); return NULL; }
+    return c;
+}
+
+static void cursor_release(bpt_cursor *c) {
+    if (c->has_leaf) { node_free(&c->leaf); c->has_leaf = 0; }
+    while (c->depth > 0) node_free(&c->stack[--c->depth].node);
+}
+
+int bpt_cursor_next(bpt_cursor *c, bpt_key *key,
+                    const uint8_t **val, size_t *val_len) {
+    if (c->done) return 0;
+    for (;;) {
+        if (c->has_leaf && c->leaf_pos < c->leaf.n_keys) {
+            bpt_key *k = &c->leaf.keys[c->leaf_pos];
+            if (c->has_max && key_cmp(k, &c->max) > 0) break;   /* past max */
+            *key = *k;
+            *val = c->leaf.values[c->leaf_pos].bytes;
+            *val_len = c->leaf.values[c->leaf_pos].len;
+            c->leaf_pos++;
+            return 1;
+        }
+        /* Leaf exhausted (deletions can leave empty leaves — skip them):
+         * ascend to the nearest frame with children left, descend leftmost. */
+        if (c->has_leaf) { node_free(&c->leaf); c->has_leaf = 0; }
+        int advanced = 0;
+        while (c->depth > 0) {
+            cur_frame *f = &c->stack[c->depth - 1];
+            if (f->idx < f->node.n_children) {
+                double ptr = f->node.children[f->idx++];
+                int e = cursor_descend(c, ptr, 0);
+                if (e) { c->done = 1; cursor_release(c); return e; }
+                advanced = 1;
+                break;
+            }
+            node_free(&f->node);
+            c->depth--;
+        }
+        if (!advanced) break;   /* whole tree exhausted */
+    }
+    c->done = 1;
+    cursor_release(c);
+    return 0;
+}
+
+int bpt_cursor_next_batch(bpt_cursor *c, size_t max_bytes, int *count,
+                          const uint8_t **out_ptr, size_t *out_len) {
+    bpt *t = c->t;
+    bj_builder *b = t->bld;
+    bj_builder_reset(b);
+    bj_begin_array(b);
+    int n = 0;
+    size_t approx = 0;
+    while (approx < max_bytes) {
+        bpt_key k; const uint8_t *v; size_t vl;
+        int r = bpt_cursor_next(c, &k, &v, &vl);
+        if (r < 0) return r;
+        if (r == 0) break;
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"key", 3);   emit_key(b, &k);
+        bj_put_key(b, (const uint8_t *)"value", 5); bj_put_raw(b, v, vl);
+        bj_end_object(b);
+        n++;
+        approx += vl + (k.is_string ? (size_t)k.str_len + 5 : 9) + 26;
+    }
+    bj_end_array(b);
+    int e = bj_builder_error(b);
+    if (e) return e;
+    size_t len;
+    const uint8_t *d = bj_builder_data(b, &len);
+    if (!d) return BJ_ERR_STATE;
+    e = set_out(t, d, len);
+    if (e) return e;
+    *count = n;
+    *out_ptr = t->out;
+    *out_len = t->out_len;
+    return BJ_OK;
+}
+
+void bpt_cursor_close(bpt_cursor *c) {
+    if (!c) return;
+    cursor_release(c);
+    if (c->has_min) key_free(&c->min);
+    if (c->has_max) key_free(&c->max);
+    free(c);
+}
+
 int bpt_height(bpt *t, int *out_height) {
     int h = 0;
     double ptr = t->root;

@@ -84,6 +84,42 @@ int bpt_height(bpt *t, int *out_height);
  */
 int bpt_compact(bpt *t, const bj_io *dst);
 
+/* ---- Cursors ---------------------------------------------------------- */
+
+/*
+ * A cursor streams entries in sorted key order with bounded memory: it holds
+ * a descent stack plus the current leaf (O(height) state) and reads one leaf
+ * at a time, never materializing the result set.
+ *
+ * Cursors pin the root pointer at open, so they iterate a consistent
+ * snapshot: because the tree is append-only, a cursor stays valid across
+ * concurrent bpt_add/bpt_delete calls on the same tree and simply does not
+ * see them. Close every cursor before bpt_free.
+ */
+typedef struct bpt_cursor bpt_cursor;
+
+/* Open a cursor over min <= key <= max; either bound may be NULL for an open
+ * end (both NULL = full scan). Returns NULL on OOM or unreadable root. */
+bpt_cursor *bpt_cursor_open(bpt *t, const bpt_key *min, const bpt_key *max);
+/*
+ * Advance to the next entry. Returns 1 with *key / *val / *val_len exposing
+ * the entry (pointers valid until the next call on this cursor), 0 at end,
+ * or a negative BJ_ERR_* code.
+ */
+int bpt_cursor_next(bpt_cursor *c, bpt_key *key,
+                    const uint8_t **val, size_t *val_len);
+/*
+ * Pull entries in bulk: encode entries as a binjson ARRAY of { key, value }
+ * objects into the tree's output buffer until roughly `max_bytes` of payload
+ * is gathered or the cursor ends. Writes the entry count through *count
+ * (0 = end); bytes are exposed via out_ptr/out_len (valid until the next
+ * operation on the tree).
+ */
+int bpt_cursor_next_batch(bpt_cursor *c, size_t max_bytes, int *count,
+                          const uint8_t **out_ptr, size_t *out_len);
+/* Release a cursor (never touches the file). Safe to pass NULL. */
+void bpt_cursor_close(bpt_cursor *c);
+
 #ifdef __cplusplus
 }
 #endif

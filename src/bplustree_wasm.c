@@ -100,6 +100,34 @@ EMSCRIPTEN_KEEPALIVE int bptw_compact(bpt *t, int dst_fd) {
     return bpt_compact(t, &dst);
 }
 
+/*
+ * Cursors: open over [min, max] where a key type of -1 means "no bound"
+ * (both -1 = full scan). bptw_cursor_next pulls up to ~max_bytes of entries
+ * as a binjson ARRAY of { key, value } into the shared out buffer and
+ * returns the entry count (0 = end) or a negative error.
+ */
+EMSCRIPTEN_KEEPALIVE bpt_cursor *bptw_cursor_open(bpt *t,
+        int minType, double minNum, const uint8_t *minPtr, int minLen,
+        int maxType, double maxNum, const uint8_t *maxPtr, int maxLen) {
+    bpt_key mn, mx;
+    const bpt_key *pmn = NULL, *pmx = NULL;
+    if (minType >= 0) { mn = make_key(minType, minNum, minPtr, minLen); pmn = &mn; }
+    if (maxType >= 0) { mx = make_key(maxType, maxNum, maxPtr, maxLen); pmx = &mx; }
+    return bpt_cursor_open(t, pmn, pmx);
+}
+
+EMSCRIPTEN_KEEPALIVE int bptw_cursor_next(bpt_cursor *cur, int max_bytes) {
+    g_out_ptr = NULL; g_out_len = 0;
+    int count = 0;
+    int e = bpt_cursor_next_batch(cur, (size_t)max_bytes, &count,
+                                  &g_out_ptr, &g_out_len);
+    return e ? e : count;
+}
+
+EMSCRIPTEN_KEEPALIVE void bptw_cursor_free(bpt_cursor *cur) {
+    bpt_cursor_close(cur);
+}
+
 EMSCRIPTEN_KEEPALIVE double bptw_size(bpt *t)    { return bpt_size(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return bpt_root(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return bpt_next_id(t); }
