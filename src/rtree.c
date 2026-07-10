@@ -65,7 +65,18 @@ typedef struct {
     int     n;               /* number of children */
     rentry *entries;         /* leaf: n entries */
     double *children;        /* internal: n pointer offsets */
+    rbbox  *child_bboxes;    /* internal: n child boxes when has_cb */
+    int     has_cb;          /* childBBoxes present (see below)     */
 } rnode;
+
+/*
+ * Internal nodes additionally persist a "childBBoxes" array — one bounding
+ * box per child, in child order — so choose-subtree, bbox recomputation,
+ * node splitting and search pruning never need to load child nodes. The
+ * field is optional on read: nodes written by the JS reference (which
+ * ignores the field and keeps its own behavior) or by older builds lack it,
+ * and fall back to loading children; they are upgraded whenever rewritten.
+ */
 
 /* ---- Dynamic byte buffer -------------------------------------------- */
 
@@ -270,6 +281,7 @@ static void node_init(rnode *n) { memset(n, 0, sizeof(*n)); }
 static void node_free(rnode *n) {
     free(n->entries);
     free(n->children);
+    free(n->child_bboxes);
     node_init(n);
 }
 
@@ -285,6 +297,7 @@ static int parse_node(rtree *t, double offset, rnode *out) {
     int e = object_begin(&c, &count);
     if (e) return e;
 
+    int cb_n = -1;   /* childBBoxes element count, -1 = field absent */
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kn; uint32_t klen;
         if ((e = take_key(&c, &kn, &klen))) { node_free(out); return e; }
@@ -294,6 +307,19 @@ static int parse_node(rtree *t, double offset, rnode *out) {
             if ((e = read_bool(&c, &out->is_leaf))) { node_free(out); return e; }
         } else if (name_eq(kn, klen, "bbox")) {
             if ((e = read_bbox(&c, &out->bbox))) { node_free(out); return e; }
+        } else if (name_eq(kn, klen, "childBBoxes")) {
+            uint32_t n;
+            if ((e = array_begin(&c, &n))) { node_free(out); return e; }
+            free(out->child_bboxes);
+            out->child_bboxes = NULL;
+            if (n) {
+                out->child_bboxes = (rbbox *)calloc(n, sizeof(rbbox));
+                if (!out->child_bboxes) { node_free(out); return BJ_ERR_OOM; }
+            }
+            for (uint32_t j = 0; j < n; j++) {
+                if ((e = read_bbox(&c, &out->child_bboxes[j]))) { node_free(out); return e; }
+            }
+            cb_n = (int)n;
         } else if (name_eq(kn, klen, "children")) {
             uint32_t n;
             if ((e = array_begin(&c, &n))) { node_free(out); return e; }
@@ -329,6 +355,9 @@ static int parse_node(rtree *t, double offset, rnode *out) {
             if ((e = skip_value(&c))) { node_free(out); return e; }
         }
     }
+    /* childBBoxes is trusted only when it matches the child count exactly. */
+    out->has_cb = (!out->is_leaf && cb_n == out->n && cb_n >= 0);
+    if (!out->has_cb) { free(out->child_bboxes); out->child_bboxes = NULL; }
     return BJ_OK;
 }
 
@@ -371,6 +400,12 @@ static int encode_node(rtree *t, const rnode *nd, bjfile *dst, double *off) {
         for (int i = 0; i < nd->n; i++) bj_put_pointer(b, (uint64_t)nd->children[i]);
     }
     bj_end_array(b);
+    if (!nd->is_leaf && nd->has_cb) {
+        bj_put_key(b, (const uint8_t *)"childBBoxes", 11);
+        bj_begin_array(b);
+        for (int i = 0; i < nd->n; i++) emit_bbox(b, &nd->child_bboxes[i]);
+        bj_end_array(b);
+    }
     bj_put_key(b, (const uint8_t *)"bbox", 4);    emit_bbox(b, &nd->bbox);
     bj_end_object(b);
 
@@ -460,15 +495,39 @@ static void meta_apply(rtree *t, const rt_meta *m) {
 
 /* ---- Node construction & bbox --------------------------------------- */
 
-/* The bounding box of child `i`: leaf children carry their own point box;
- * internal children require loading the referenced node. */
+/* The bounding box of child `i`: leaf children carry their own point box,
+ * internal children theirs in childBBoxes; only legacy nodes (no
+ * childBBoxes on disk) fall back to loading the referenced node. */
 static int child_bbox(rtree *t, const rnode *nd, int i, rbbox *out) {
     if (nd->is_leaf) { *out = nd->entries[i].bbox; return BJ_OK; }
+    if (nd->has_cb) { *out = nd->child_bboxes[i]; return BJ_OK; }
     rnode ch;
     int e = parse_node(t, nd->children[i], &ch);
     if (e) return e;
     *out = ch.bbox;
     node_free(&ch);
+    return BJ_OK;
+}
+
+/* Materialize childBBoxes on a legacy internal node (one child load each);
+ * the node carries them from its next save onward. */
+static int ensure_child_bboxes(rtree *t, rnode *nd) {
+    if (nd->is_leaf || nd->has_cb) return BJ_OK;
+    rbbox *cb = NULL;
+    if (nd->n) {
+        cb = (rbbox *)calloc((size_t)nd->n, sizeof(rbbox));
+        if (!cb) return BJ_ERR_OOM;
+    }
+    for (int i = 0; i < nd->n; i++) {
+        rnode ch;
+        int e = parse_node(t, nd->children[i], &ch);
+        if (e) { free(cb); return e; }
+        cb[i] = ch.bbox;
+        node_free(&ch);
+    }
+    free(nd->child_bboxes);
+    nd->child_bboxes = cb;
+    nd->has_cb = 1;
     return BJ_OK;
 }
 
@@ -496,20 +555,29 @@ static int make_leaf(rnode *out, double id, const rentry *entries, int n) {
     }
     return BJ_OK;
 }
-static int make_internal(rnode *out, double id, const double *children, int n) {
+/* Build an internal node from parallel child-pointer and child-bbox arrays. */
+static int make_internal(rnode *out, double id, const double *children,
+                         const rbbox *cbs, int n) {
     node_init(out);
     out->id = id; out->is_leaf = 0; out->n = n;
     if (n) {
         out->children = (double *)malloc((size_t)n * sizeof(double));
-        if (!out->children) return BJ_ERR_OOM;
+        out->child_bboxes = (rbbox *)malloc((size_t)n * sizeof(rbbox));
+        if (!out->children || !out->child_bboxes) return BJ_ERR_OOM;
         memcpy(out->children, children, (size_t)n * sizeof(double));
+        memcpy(out->child_bboxes, cbs, (size_t)n * sizeof(rbbox));
     }
+    out->has_cb = 1;
     return BJ_OK;
 }
 
 /* ---- Split (mirrors _split) ----------------------------------------- */
 
-typedef struct { int split; double ptr, ptr2; } ins_res;
+typedef struct {
+    int    split;
+    double ptr, ptr2;      /* saved node offset(s)                 */
+    rbbox  bbox, bbox2;    /* their bounding boxes (for the parent) */
+} ins_res;
 
 /* Split the overflowing in-memory `nd` into two saved nodes. */
 static int split_node(rtree *t, const rnode *nd, ins_res *out) {
@@ -566,15 +634,20 @@ static int split_node(rtree *t, const rnode *nd, ins_res *out) {
     } else {
         double *p1 = (double *)malloc((size_t)c1 * sizeof(double));
         double *p2 = (double *)malloc((size_t)c2 * sizeof(double));
-        if (!p1 || !p2) { free(p1); free(p2); free(cb); free(grp); return BJ_ERR_OOM; }
+        rbbox  *b1 = (rbbox *)malloc((size_t)c1 * sizeof(rbbox));
+        rbbox  *b2 = (rbbox *)malloc((size_t)c2 * sizeof(rbbox));
+        if (!p1 || !p2 || !b1 || !b2) {
+            free(p1); free(p2); free(b1); free(b2); free(cb); free(grp);
+            return BJ_ERR_OOM;
+        }
         int k1 = 0, k2 = 0;
         for (int i = 0; i < n; i++) {
-            if (grp[i] == 1) p1[k1++] = nd->children[i];
-            else             p2[k2++] = nd->children[i];
+            if (grp[i] == 1) { b1[k1] = cb[i]; p1[k1++] = nd->children[i]; }
+            else             { b2[k2] = cb[i]; p2[k2++] = nd->children[i]; }
         }
-        e = make_internal(&n1, nd->id, p1, k1);
-        if (!e) e = make_internal(&n2, t->next_id++, p2, k2);
-        free(p1); free(p2);
+        e = make_internal(&n1, nd->id, p1, b1, k1);
+        if (!e) e = make_internal(&n2, t->next_id++, p2, b2, k2);
+        free(p1); free(p2); free(b1); free(b2);
     }
     free(cb); free(grp);
     if (e) { node_free(&n1); node_free(&n2); return e; }
@@ -585,7 +658,9 @@ static int split_node(rtree *t, const rnode *nd, ins_res *out) {
     if (!e) e = save_node(t, &n2, &rp);
     node_free(&n1); node_free(&n2);
     if (e) return e;
-    out->split = 1; out->ptr = lp; out->ptr2 = rp;
+    out->split = 1;
+    out->ptr = lp;   out->bbox = gb1;
+    out->ptr2 = rp;  out->bbox2 = gb2;
     return BJ_OK;
 }
 
@@ -624,11 +699,15 @@ static int insert_node(rtree *t, double ptr, const rentry *entry, ins_res *out) 
             e = split_node(t, &nd, out);
         } else {
             e = compute_bbox(t, &nd);
-            if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); }
+            if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); out->bbox = nd.bbox; }
         }
         node_free(&nd);
         return e;
     }
+
+    /* Upgrade legacy nodes once — the rewrite below persists the boxes. */
+    e = ensure_child_bboxes(t, &nd);
+    if (e) { node_free(&nd); return e; }
 
     int idx;
     e = choose_subtree(t, &nd, &entry->bbox, &idx);
@@ -642,19 +721,23 @@ static int insert_node(rtree *t, double ptr, const rentry *entry, ins_res *out) 
         double *nc = (double *)realloc(nd.children, (size_t)(nd.n + 1) * sizeof(double));
         if (!nc) { node_free(&nd); return BJ_ERR_OOM; }
         nd.children = nc;
-        nd.children[idx] = cr.ptr;
-        nd.children[nd.n] = cr.ptr2;
+        rbbox *ncb = (rbbox *)realloc(nd.child_bboxes, (size_t)(nd.n + 1) * sizeof(rbbox));
+        if (!ncb) { node_free(&nd); return BJ_ERR_OOM; }
+        nd.child_bboxes = ncb;
+        nd.children[idx] = cr.ptr;      nd.child_bboxes[idx] = cr.bbox;
+        nd.children[nd.n] = cr.ptr2;    nd.child_bboxes[nd.n] = cr.bbox2;
         nd.n++;
         if (nd.n > t->max_entries) {
             e = split_node(t, &nd, out);
         } else {
             e = compute_bbox(t, &nd);
-            if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); }
+            if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); out->bbox = nd.bbox; }
         }
     } else {
         nd.children[idx] = cr.ptr;
+        nd.child_bboxes[idx] = cr.bbox;
         e = compute_bbox(t, &nd);
-        if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); }
+        if (!e) { out->split = 0; e = save_node(t, &nd, &out->ptr); out->bbox = nd.bbox; }
     }
     node_free(&nd);
     return e;
@@ -675,8 +758,9 @@ static int insert_root(rtree *t, double lat, double lng, const uint8_t *oid12) {
 
     if (res.split) {
         double children[2] = { res.ptr, res.ptr2 };
+        rbbox  cbs[2] = { res.bbox, res.bbox2 };
         rnode nr;
-        e = make_internal(&nr, t->next_id++, children, 2);
+        e = make_internal(&nr, t->next_id++, children, cbs, 2);
         if (e) return e;
         e = compute_bbox(t, &nr);
         if (!e) e = save_node(t, &nr, &t->root);
@@ -718,12 +802,13 @@ static int oid_eq(const uint8_t *a, const uint8_t *b) { return memcmp(a, b, 12) 
 
 /*
  * Redistribute or merge an underflowing child with a sibling. On success sets
- * *merged; when merged, out_children/out_count hold the parent's new child
- * pointer list (caller takes ownership of the malloc'd array).
+ * *merged; when merged, out_children/out_bboxes/out_count hold the parent's
+ * new child pointer and bbox lists (caller takes ownership of both arrays).
+ * The parent must have its childBBoxes materialized (ensure_child_bboxes).
  */
 static int handle_underflow(rtree *t, const rnode *parent, int child_index,
-                            const del_res *cr, double **out_children,
-                            int *out_count, int *merged) {
+                            del_res *cr, double **out_children,
+                            rbbox **out_bboxes, int *out_count, int *merged) {
     *merged = 0;
     /* Gather up to two siblings (prev then next). */
     int sib_idx[2]; rnode sib[2]; int nsib = 0;
@@ -740,6 +825,14 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
 
     int is_leaf = cr->node.is_leaf;
     int e = BJ_OK;
+
+    /* Internal children combine their childBBoxes lists; materialize them on
+     * any legacy participant first. */
+    if (!is_leaf) {
+        e = ensure_child_bboxes(t, &cr->node);
+        for (int s = 0; s < nsib && !e; s++) e = ensure_child_bboxes(t, &sib[s]);
+        if (e) goto done;
+    }
 
     /* Try to borrow from a sibling with spare children (redistribute). */
     for (int s = 0; s < nsib; s++) {
@@ -758,15 +851,19 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
             free(all);
         } else {
             double *all = (double *)malloc((size_t)total * sizeof(double));
-            if (!all) { e = BJ_ERR_OOM; goto done; }
+            rbbox *allb = (rbbox *)malloc((size_t)total * sizeof(rbbox));
+            if (!all || !allb) { free(all); free(allb); e = BJ_ERR_OOM; goto done; }
             memcpy(all, cr->node.children, (size_t)cr->node.n * sizeof(double));
             memcpy(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(double));
-            e = make_internal(&nc1, cr->node.id, all, mid);
-            if (!e) e = make_internal(&nc2, sib[s].id, all + mid, total - mid);
-            free(all);
+            memcpy(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
+            memcpy(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
+            e = make_internal(&nc1, cr->node.id, all, allb, mid);
+            if (!e) e = make_internal(&nc2, sib[s].id, all + mid, allb + mid, total - mid);
+            free(all); free(allb);
         }
         if (!e) e = compute_bbox(t, &nc1);
         if (!e) e = compute_bbox(t, &nc2);
+        rbbox bb1 = nc1.bbox, bb2 = nc2.bbox;
         double p1 = 0, p2 = 0;
         if (!e) e = save_node(t, &nc1, &p1);
         if (!e) e = save_node(t, &nc2, &p2);
@@ -774,12 +871,15 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         if (e) goto done;
 
         double *newc = (double *)malloc((size_t)parent->n * sizeof(double));
-        if (!newc) { e = BJ_ERR_OOM; goto done; }
+        rbbox *newb = (rbbox *)malloc((size_t)parent->n * sizeof(rbbox));
+        if (!newc || !newb) { free(newc); free(newb); e = BJ_ERR_OOM; goto done; }
         memcpy(newc, parent->children, (size_t)parent->n * sizeof(double));
+        memcpy(newb, parent->child_bboxes, (size_t)parent->n * sizeof(rbbox));
         int lo = child_index < sib_idx[s] ? child_index : sib_idx[s];
         int hi = child_index < sib_idx[s] ? sib_idx[s] : child_index;
-        newc[lo] = p1; newc[hi] = p2;
-        *out_children = newc; *out_count = parent->n; *merged = 1;
+        newc[lo] = p1; newb[lo] = bb1;
+        newc[hi] = p2; newb[hi] = bb2;
+        *out_children = newc; *out_bboxes = newb; *out_count = parent->n; *merged = 1;
         goto done;
     }
 
@@ -798,27 +898,34 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
             free(all);
         } else {
             double *all = (double *)malloc((size_t)total * sizeof(double));
-            if (!all) { e = BJ_ERR_OOM; goto done; }
+            rbbox *allb = (rbbox *)malloc((size_t)total * sizeof(rbbox));
+            if (!all || !allb) { free(all); free(allb); e = BJ_ERR_OOM; goto done; }
             memcpy(all, cr->node.children, (size_t)cr->node.n * sizeof(double));
             memcpy(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(double));
-            e = make_internal(&m, t->next_id++, all, total);
-            free(all);
+            memcpy(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
+            memcpy(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
+            e = make_internal(&m, t->next_id++, all, allb, total);
+            free(all); free(allb);
         }
         if (!e) e = compute_bbox(t, &m);
+        rbbox mb = m.bbox;
         double mp = 0;
         if (!e) e = save_node(t, &m, &mp);
         node_free(&m);
         if (e) goto done;
 
         double *newc = (double *)malloc((size_t)parent->n * sizeof(double));
-        if (!newc) { e = BJ_ERR_OOM; goto done; }
+        rbbox *newb = (rbbox *)malloc((size_t)parent->n * sizeof(rbbox));
+        if (!newc || !newb) { free(newc); free(newb); e = BJ_ERR_OOM; goto done; }
         int k = 0;
         for (int i = 0; i < parent->n; i++) {
             if (i == child_index || i == sib_idx[s]) continue;
+            newb[k] = parent->child_bboxes[i];
             newc[k++] = parent->children[i];
         }
+        newb[k] = mb;
         newc[k++] = mp;
-        *out_children = newc; *out_count = k; *merged = 1;
+        *out_children = newc; *out_bboxes = newb; *out_count = k; *merged = 1;
     }
 
 done:
@@ -859,22 +966,32 @@ static int remove_node(rtree *t, double ptr, const uint8_t *oid, del_res *out) {
         if (e) { free(updated); node_free(&nd); return e; }
         if (!cr.found) { continue; }
 
-        double *newc = NULL; int newcount = 0, merged = 0;
+        /* This node will be rewritten: materialize its child boxes so the
+         * update below (and the saved copy) carries them. */
+        e = ensure_child_bboxes(t, &nd);
+        if (e) { node_free(&cr.node); free(updated); node_free(&nd); return e; }
+        rbbox *updated_b = (rbbox *)malloc((size_t)nd.n * sizeof(rbbox));
+        if (!updated_b) { node_free(&cr.node); free(updated); node_free(&nd); return BJ_ERR_OOM; }
+        memcpy(updated_b, nd.child_bboxes, (size_t)nd.n * sizeof(rbbox));
+
+        double *newc = NULL; rbbox *newb = NULL; int newcount = 0, merged = 0;
         if (cr.underflow) {
-            e = handle_underflow(t, &nd, i, &cr, &newc, &newcount, &merged);
-            if (e) { node_free(&cr.node); free(updated); node_free(&nd); return e; }
-            if (!merged) updated[i] = cr.ptr;
+            e = handle_underflow(t, &nd, i, &cr, &newc, &newb, &newcount, &merged);
+            if (e) { node_free(&cr.node); free(updated); free(updated_b); node_free(&nd); return e; }
+            if (!merged) { updated[i] = cr.ptr; updated_b[i] = cr.node.bbox; }
         } else {
             updated[i] = cr.ptr;
+            updated_b[i] = cr.node.bbox;
         }
         node_free(&cr.node);
 
         rnode un;
         double *use = merged ? newc : updated;
+        rbbox *useb = merged ? newb : updated_b;
         int count = merged ? newcount : nd.n;
-        e = make_internal(&un, nd.id, use, count);   /* deep-copies `use` */
-        free(updated);
-        free(newc);                                  /* NULL-safe when not merged */
+        e = make_internal(&un, nd.id, use, useb, count);   /* deep-copies */
+        free(updated); free(updated_b);
+        free(newc); free(newb);                 /* NULL-safe when not merged */
         if (!e) e = compute_bbox(t, &un);
         if (!e) e = save_node(t, &un, &out->ptr);
         if (e) { node_free(&un); node_free(&nd); return e; }
@@ -963,6 +1080,11 @@ static int search_rec(rtree *t, double ptr, const rbbox *q, bj_builder *b) {
         }
     } else {
         for (int i = 0; i < nd.n; i++) {
+            /* childBBoxes lets non-overlapping subtrees be skipped without
+             * even parsing their root node. */
+            if (nd.has_cb &&
+                (!nd.child_bboxes[i].valid || !bbox_intersects(q, &nd.child_bboxes[i])))
+                continue;
             e = search_rec(t, nd.children[i], q, b);
             if (e) { node_free(&nd); return e; }
         }
@@ -1014,6 +1136,9 @@ static int search_radius_rec(rtree *t, double ptr, const rbbox *q,
         }
     } else {
         for (int i = 0; i < nd.n; i++) {
+            if (nd.has_cb &&
+                (!nd.child_bboxes[i].valid || !bbox_intersects(q, &nd.child_bboxes[i])))
+                continue;
             e = search_radius_rec(t, nd.children[i], q, lat, lng, radius_km, b);
             if (e) { node_free(&nd); return e; }
         }
@@ -1098,20 +1223,38 @@ static void ptrmap_free(ptrmap *m) {
 }
 
 static int clone_node(rtree *t, bjfile *dst, ptrmap *m, double old_off,
-                      double *new_off, int depth) {
+                      double *new_off, rbbox *out_bbox, int depth) {
     if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
-    if (ptrmap_get(m, old_off, new_off)) return BJ_OK;
+    if (ptrmap_get(m, old_off, new_off)) {
+        if (out_bbox) {   /* dedup never hits on a well-formed tree */
+            rnode nd;
+            int e = parse_node(t, old_off, &nd);
+            if (e) return e;
+            *out_bbox = nd.bbox;
+            node_free(&nd);
+        }
+        return BJ_OK;
+    }
     rnode nd;
     int e = parse_node(t, old_off, &nd);
     if (e) return e;
     if (!nd.is_leaf) {
+        /* Rebuild childBBoxes from the cloned children — this refreshes them
+         * and upgrades legacy nodes as a side effect of compaction. */
+        if (!nd.child_bboxes && nd.n) {
+            nd.child_bboxes = (rbbox *)calloc((size_t)nd.n, sizeof(rbbox));
+            if (!nd.child_bboxes) { node_free(&nd); return BJ_ERR_OOM; }
+        }
         for (int i = 0; i < nd.n; i++) {
-            double nc;
-            e = clone_node(t, dst, m, nd.children[i], &nc, depth + 1);
+            double nc; rbbox cbb;
+            e = clone_node(t, dst, m, nd.children[i], &nc, &cbb, depth + 1);
             if (e) { node_free(&nd); return e; }
             nd.children[i] = nc;
+            nd.child_bboxes[i] = cbb;
         }
+        nd.has_cb = 1;
     }
+    if (out_bbox) *out_bbox = nd.bbox;
     e = encode_node(t, &nd, dst, new_off);
     node_free(&nd);
     if (e) return e;
@@ -1125,7 +1268,7 @@ int rtree_compact(rtree *t, const bj_io *dst_io) {
     ptrmap m; memset(&m, 0, sizeof(m));
     double new_root = 0;
     int e = bjfile_append_header(&dst, t->bld, "rtree");
-    if (!e) e = clone_node(t, &dst, &m, t->root, &new_root, 0);
+    if (!e) e = clone_node(t, &dst, &m, t->root, &new_root, NULL, 0);
     if (!e) e = encode_metadata(t, &dst, new_root);
     if (!e) e = bjfile_commit(&dst);
     ptrmap_free(&m);
