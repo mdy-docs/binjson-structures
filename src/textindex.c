@@ -15,25 +15,67 @@
 
 /* ---- Insertion-ordered string -> number dictionary ------------------ */
 
+/*
+ * Entries live in insertion-ordered parallel arrays — iteration order must
+ * match the JS reference's Map/object semantics (it fixes encoded field order
+ * and sort tie-breaking). A linear-probing hash table over those arrays makes
+ * lookups O(1): slots hold entry index + 1 (0 = empty), capacity is a power
+ * of two kept at least 2x the entry count.
+ */
 typedef struct {
     char   **keys;   /* owned key bytes (not NUL-terminated) */
     int     *klen;
     double  *vals;
     int      n, cap;
+    int     *slots;    /* hash index over entries; entry index + 1, 0 empty */
+    int      slot_cap; /* power of two; 0 until first insert */
 } dict;
 
 static void dict_init(dict *d) { memset(d, 0, sizeof(*d)); }
 static void dict_free(dict *d) {
     for (int i = 0; i < d->n; i++) free(d->keys[i]);
-    free(d->keys); free(d->klen); free(d->vals);
+    free(d->keys); free(d->klen); free(d->vals); free(d->slots);
     memset(d, 0, sizeof(*d));
 }
+static uint32_t dict_hash(const char *k, int klen) {
+    uint32_t h = 2166136261u; /* FNV-1a */
+    for (int i = 0; i < klen; i++) { h ^= (uint8_t)k[i]; h *= 16777619u; }
+    return h;
+}
 static int dict_find(const dict *d, const char *k, int klen) {
-    for (int i = 0; i < d->n; i++)
+    if (!d->slot_cap) return -1;
+    uint32_t m = (uint32_t)d->slot_cap - 1;
+    for (uint32_t s = dict_hash(k, klen) & m;; s = (s + 1) & m) {
+        int e = d->slots[s];
+        if (!e) return -1;
+        int i = e - 1;
         if (d->klen[i] == klen && memcmp(d->keys[i], k, (size_t)klen) == 0) return i;
-    return -1;
+    }
+}
+static void slot_insert(dict *d, int entry) {
+    uint32_t m = (uint32_t)d->slot_cap - 1;
+    uint32_t s = dict_hash(d->keys[entry], d->klen[entry]) & m;
+    while (d->slots[s]) s = (s + 1) & m;
+    d->slots[s] = entry + 1;
+}
+/* Rebuild the hash index from the entry arrays. Reuses the existing slots
+ * allocation when it is still big enough, so callers that only shrink or
+ * reorder entries (remove, compaction) cannot fail. */
+static int dict_reindex(dict *d) {
+    if (d->slot_cap < 2 * (d->n + 1)) {
+        int nc = d->slot_cap ? d->slot_cap : 16;
+        while (nc < 2 * (d->n + 1)) nc *= 2;
+        int *ns = malloc((size_t)nc * sizeof(int));
+        if (!ns) return BJ_ERR_OOM;
+        free(d->slots);
+        d->slots = ns; d->slot_cap = nc;
+    }
+    memset(d->slots, 0, (size_t)d->slot_cap * sizeof(int));
+    for (int i = 0; i < d->n; i++) slot_insert(d, i);
+    return BJ_OK;
 }
 static int dict_reserve(dict *d) {
+    if (d->slot_cap < 2 * (d->n + 1) && dict_reindex(d)) return BJ_ERR_OOM;
     if (d->n < d->cap) return BJ_OK;
     int nc = d->cap ? d->cap * 2 : 8;
     char **nk = realloc(d->keys, (size_t)nc * sizeof(char *));
@@ -50,7 +92,8 @@ static int dict_set(dict *d, const char *k, int klen, double val) {
     char *cp = malloc((size_t)klen ? (size_t)klen : 1);
     if (!cp) return BJ_ERR_OOM;
     if (klen) memcpy(cp, k, (size_t)klen);
-    d->keys[d->n] = cp; d->klen[d->n] = klen; d->vals[d->n] = val; d->n++;
+    d->keys[d->n] = cp; d->klen[d->n] = klen; d->vals[d->n] = val;
+    slot_insert(d, d->n); d->n++;
     return BJ_OK;
 }
 static int dict_inc(dict *d, const char *k, int klen) {
@@ -64,6 +107,7 @@ static void dict_remove(dict *d, const char *k, int klen) {
     free(d->keys[i]);
     for (int j = i; j < d->n - 1; j++) { d->keys[j] = d->keys[j + 1]; d->klen[j] = d->klen[j + 1]; d->vals[j] = d->vals[j + 1]; }
     d->n--;
+    dict_reindex(d); /* entry indices shifted; cannot fail (table shrank) */
 }
 
 /* ---- Stop words (verbatim from src/textindex.js) -------------------- */
@@ -558,13 +602,16 @@ int tix_query_all(bpt *index, bpt *doc_terms, bpt *doc_lengths,
         if ((e = bpt_search(index, &kt, &found, &vp, &vl))) break;
         dict setT; dict_init(&setT);
         if (found) e = decode_obj(vp, vl, &setT);
-        for (int i = 0; i < cand.n; ) {
+        int w = 0;
+        for (int i = 0; i < cand.n; i++) {
             if (dict_find(&setT, cand.keys[i], cand.klen[i]) < 0) {
                 free(cand.keys[i]);
-                for (int j = i; j < cand.n - 1; j++) { cand.keys[j] = cand.keys[j + 1]; cand.klen[j] = cand.klen[j + 1]; cand.vals[j] = cand.vals[j + 1]; }
-                cand.n--;
-            } else i++;
+            } else {
+                cand.keys[w] = cand.keys[i]; cand.klen[w] = cand.klen[i]; cand.vals[w] = cand.vals[i]; w++;
+            }
         }
+        cand.n = w;
+        dict_reindex(&cand); /* cannot fail: entry count only shrank */
         dict_free(&setT);
     }
 
