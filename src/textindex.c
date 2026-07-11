@@ -188,12 +188,14 @@ static int decode_obj(const uint8_t *blob, size_t len, dict *d) {
 
 /* ---- Value encoders (binjson) --------------------------------------- */
 
-/* Encode a dict as a { string: int } object into a reusable builder; expose
- * bytes via data/dlen (valid until the builder is reset or freed). */
-static int encode_obj(bj_builder *b, const dict *d, const uint8_t **data, size_t *dlen) {
+/* Encode entries [from, to) of a dict as a { string: int } object into a
+ * reusable builder; expose bytes via data/dlen (valid until the builder is
+ * reset or freed). */
+static int encode_obj_range(bj_builder *b, const dict *d, int from, int to,
+                            const uint8_t **data, size_t *dlen) {
     bj_builder_reset(b);
     bj_begin_object(b);
-    for (int i = 0; i < d->n; i++) {
+    for (int i = from; i < to; i++) {
         bj_put_key(b, (const uint8_t *)d->keys[i], (uint32_t)d->klen[i]);
         bj_put_int(b, (int64_t)d->vals[i]);
     }
@@ -205,9 +207,322 @@ static int encode_obj(bj_builder *b, const dict *d, const uint8_t **data, size_t
     *data = p;
     return BJ_OK;
 }
+static int encode_obj(bj_builder *b, const dict *d, const uint8_t **data, size_t *dlen) {
+    return encode_obj_range(b, d, 0, d->n, data, dlen);
+}
 
 static bpt_key str_key(const char *s, int len) {
     bpt_key k; k.is_string = 1; k.num = 0; k.str = (const uint8_t *)s; k.str_len = (uint32_t)len; return k;
+}
+
+/* ---- Block-partitioned postings -------------------------------------- */
+
+/*
+ * A term's posting list is stored as fixed-capacity blocks so that adding a
+ * document rewrites O(1) bytes instead of the whole list (the legacy layout
+ * rewrote a blob that grows with every matching document: O(d²) total bytes
+ * for a term matching d docs). Keys in the index tree:
+ *
+ *   "term"           legacy single { docId: tf } blob (the JS layout) —
+ *                    still read, and migrated to blocks when next written
+ *   "term\0"         header: block count as one INT value
+ *   "term\0<%08x>"   block i: { docId: tf } object of at most
+ *                    TIX_BLOCK_DOCS entries, docs in add order
+ *
+ * Stems never contain NUL (the tokenizer only emits word characters), so
+ * the "\0" suffix cannot collide with another term. New entries go to the
+ * highest block; a document re-added later can therefore appear in an old
+ * block too, and readers merge blocks in order into one dict where the
+ * later entry replaces the earlier (the same tf-wins, position-kept
+ * semantics as updating the legacy blob). A removal that empties every
+ * block deletes the whole chain, mirroring the legacy key deletion.
+ */
+#define TIX_BLOCK_DOCS 16
+#define TIX_MAX_BLOCKS (1 << 24)   /* sanity cap against hostile headers */
+
+/* Reusable key buffer holding term + '\0' + 8 hex digits. The bpt_key
+ * returned by the accessors points into the buffer: valid until the next
+ * accessor call or tkey_free. */
+typedef struct { char *buf; int term_len; } tkey;
+
+static int tkey_init(tkey *k, const char *term, int tlen) {
+    k->buf = (char *)malloc((size_t)tlen + 9);
+    if (!k->buf) return BJ_ERR_OOM;
+    memcpy(k->buf, term, (size_t)tlen);
+    k->buf[tlen] = '\0';
+    k->term_len = tlen;
+    return BJ_OK;
+}
+static void tkey_free(tkey *k) { free(k->buf); k->buf = NULL; }
+static bpt_key tkey_header(const tkey *k) { return str_key(k->buf, k->term_len + 1); }
+static bpt_key tkey_block(tkey *k, int i) {
+    static const char H[] = "0123456789abcdef";
+    for (int j = 0; j < 8; j++)
+        k->buf[k->term_len + 1 + j] = H[(i >> ((7 - j) * 4)) & 0xf];
+    return str_key(k->buf, k->term_len + 9);
+}
+/* Upper bound for a range scan over the term's chain: 0xff sorts after
+ * every hex digit, so [header, max] covers the header and all blocks and
+ * nothing of any other term. */
+static bpt_key tkey_range_max(tkey *k) {
+    k->buf[k->term_len + 1] = (char)0xff;
+    return str_key(k->buf, k->term_len + 2);
+}
+/* Parse the block index out of a full block key (term + NUL + 8 hex). */
+static int tkey_parse_index(const bpt_key *k, int term_len, int *out) {
+    int64_t v = 0;
+    for (int j = 0; j < 8; j++) {
+        uint8_t c = k->str[term_len + 1 + j];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else return BJ_ERR_STATE;
+        v = (v << 4) | d;
+    }
+    if (v >= TIX_MAX_BLOCKS) return BJ_ERR_STATE;
+    *out = (int)v;
+    return BJ_OK;
+}
+
+/* Decode a header value into a validated block count. */
+static int decode_block_count(const uint8_t *vp, size_t vl, int *out) {
+    cur c = { vp, vl, 0 };
+    double d;
+    int e = read_number(&c, &d);
+    if (e) return e;
+    if (!(d >= 1) || d > TIX_MAX_BLOCKS || (double)(int)d != d) return BJ_ERR_STATE;
+    *out = (int)d;
+    return BJ_OK;
+}
+
+static int write_block(bpt *index, bj_builder *b, tkey *k, int i,
+                       const dict *d, int from, int to) {
+    const uint8_t *data; size_t dlen;
+    int e = encode_obj_range(b, d, from, to, &data, &dlen);
+    if (e) return e;
+    bpt_key bk = tkey_block(k, i);
+    return bpt_add(index, &bk, data, (uint32_t)dlen);
+}
+static int write_header(bpt *index, bj_builder *b, const tkey *k, int nblocks) {
+    bj_builder_reset(b);
+    bj_put_int(b, nblocks);
+    int e = bj_builder_error(b);
+    if (e) return e;
+    size_t dlen;
+    const uint8_t *data = bj_builder_data(b, &dlen);
+    if (!data) return BJ_ERR_STATE;
+    bpt_key hk = tkey_header(k);
+    return bpt_add(index, &hk, data, (uint32_t)dlen);
+}
+
+/*
+ * Load a term's full posting list into `post`: blocks merged in key order
+ * (later entries replace earlier), or the legacy blob. A range cursor over
+ * [header, term\0\xff] reads each tree leaf once instead of paying a
+ * root-to-leaf descent per block. *state reports what was found:
+ * 1 = blocks, -1 = legacy blob, 0 = no postings.
+ */
+static int load_postings(bpt *index, const char *term, int tlen,
+                         dict *post, int *state) {
+    *state = 0;
+    tkey k;
+    int e = tkey_init(&k, term, tlen);
+    if (e) return e;
+
+    bpt_key mn = tkey_header(&k);
+    bpt_key mx = tkey_range_max(&k);
+    bpt_cursor *c = bpt_cursor_open(index, &mn, &mx);
+    if (!c) { tkey_free(&k); return BJ_ERR_OOM; }
+    int r, have_header = 0;
+    bpt_key ck; const uint8_t *v; size_t vl;
+    while ((r = bpt_cursor_next(c, &ck, &v, &vl)) == 1) {
+        if (!ck.is_string) continue;
+        if (ck.str_len == (uint32_t)tlen + 1) {          /* header */
+            have_header = 1;
+        } else if (ck.str_len == (uint32_t)tlen + 9) {   /* a block */
+            if ((e = decode_obj(v, vl, post))) break;
+            *state = 1;
+        }
+    }
+    bpt_cursor_close(c);
+    if (!e && r < 0) e = r;
+
+    /* The header is the migration commit point: blocks without one are
+     * leftovers of an interrupted legacy migration, and the legacy blob
+     * (deleted only after the header lands) is still authoritative. */
+    if (!e && *state == 1 && !have_header) {
+        dict_free(post);
+        dict_init(post);
+        *state = 0;
+    }
+
+    if (!e && *state == 0) {
+        int found; const uint8_t *vp;
+        bpt_key tk = str_key(term, tlen);
+        e = bpt_search(index, &tk, &found, &vp, &vl);
+        if (!e && found) {
+            e = decode_obj(vp, vl, post);
+            if (!e) *state = -1;
+        }
+    }
+    tkey_free(&k);
+    return e;
+}
+
+/*
+ * Merge (doc_id -> tfv) into a term's postings, touching only the active
+ * (highest) block. Legacy blobs are migrated to blocks first: split into
+ * capacity-sized blocks, header written after the blocks (a crash between
+ * leaves unreferenced block keys, never lost data), legacy key deleted
+ * last so one of the two layouts is always complete.
+ */
+static int post_add(bpt *index, bj_builder *b, const char *term, int tlen,
+                    const char *doc_id, int doc_id_len, double tfv) {
+    tkey k;
+    int e = tkey_init(&k, term, tlen);
+    if (e) return e;
+    dict blk; dict_init(&blk);
+    int found; const uint8_t *vp; size_t vl;
+
+    bpt_key hk = tkey_header(&k);
+    if ((e = bpt_search(index, &hk, &found, &vp, &vl))) goto out;
+
+    if (found) {
+        int n;
+        if ((e = decode_block_count(vp, vl, &n))) goto out;
+        bpt_key bk = tkey_block(&k, n - 1);
+        int bf;
+        e = bpt_search(index, &bk, &bf, &vp, &vl);
+        if (!e && bf) e = decode_obj(vp, vl, &blk);
+        if (e) goto out;
+        if (dict_find(&blk, doc_id, doc_id_len) < 0 && blk.n >= TIX_BLOCK_DOCS) {
+            /* Active block full: this doc starts block n. */
+            dict_free(&blk);
+            dict_init(&blk);
+            if ((e = dict_set(&blk, doc_id, doc_id_len, tfv))) goto out;
+            if ((e = write_block(index, b, &k, n, &blk, 0, blk.n))) goto out;
+            e = write_header(index, b, &k, n + 1);
+        } else {
+            if ((e = dict_set(&blk, doc_id, doc_id_len, tfv))) goto out;
+            e = write_block(index, b, &k, n - 1, &blk, 0, blk.n);
+        }
+        goto out;
+    }
+
+    /* No header: legacy blob (migrate to blocks) or a brand-new term. */
+    {
+        bpt_key tk = str_key(term, tlen);
+        if ((e = bpt_search(index, &tk, &found, &vp, &vl))) goto out;
+        if (found && (e = decode_obj(vp, vl, &blk))) goto out;
+        if ((e = dict_set(&blk, doc_id, doc_id_len, tfv))) goto out;
+        int n = (blk.n + TIX_BLOCK_DOCS - 1) / TIX_BLOCK_DOCS;
+        for (int i = 0; i < n && !e; i++) {
+            int from = i * TIX_BLOCK_DOCS;
+            int to = from + TIX_BLOCK_DOCS < blk.n ? from + TIX_BLOCK_DOCS : blk.n;
+            e = write_block(index, b, &k, i, &blk, from, to);
+        }
+        if (!e) e = write_header(index, b, &k, n);
+        if (!e && found) e = bpt_delete(index, &tk);
+    }
+
+out:
+    dict_free(&blk);
+    tkey_free(&k);
+    return e;
+}
+
+/* Remove doc_id from a term's postings; deletes the whole chain (or the
+ * legacy key) when no documents remain, like the legacy layout did. */
+static int post_remove(bpt *index, bj_builder *b, const char *term, int tlen,
+                       const char *doc_id, int doc_id_len) {
+    tkey k;
+    int e = tkey_init(&k, term, tlen);
+    if (e) return e;
+    int found; const uint8_t *vp; size_t vl;
+
+    bpt_key hk = tkey_header(&k);
+    if ((e = bpt_search(index, &hk, &found, &vp, &vl))) { tkey_free(&k); return e; }
+
+    if (found) {
+        int n;
+        if ((e = decode_block_count(vp, vl, &n))) { tkey_free(&k); return e; }
+
+        /* One range scan: count surviving entries and note the indices of
+         * blocks holding the doc (usually one; re-adds can leave more). */
+        int *hits = NULL, n_hits = 0, cap_hits = 0, remaining = 0;
+        bpt_key mn = tkey_header(&k);
+        bpt_key mx = tkey_range_max(&k);
+        bpt_cursor *c = bpt_cursor_open(index, &mn, &mx);
+        if (!c) { tkey_free(&k); return BJ_ERR_OOM; }
+        int r;
+        bpt_key ck; const uint8_t *v; size_t cvl;
+        while ((r = bpt_cursor_next(c, &ck, &v, &cvl)) == 1) {
+            if (!ck.is_string || ck.str_len != (uint32_t)tlen + 9) continue;
+            dict blk; dict_init(&blk);
+            if ((e = decode_obj(v, cvl, &blk))) { dict_free(&blk); break; }
+            if (dict_find(&blk, doc_id, doc_id_len) >= 0) {
+                int idx;
+                if ((e = tkey_parse_index(&ck, tlen, &idx))) { dict_free(&blk); break; }
+                if (n_hits == cap_hits) {
+                    int nc = cap_hits ? cap_hits * 2 : 4;
+                    int *nh = (int *)realloc(hits, (size_t)nc * sizeof(int));
+                    if (!nh) { dict_free(&blk); e = BJ_ERR_OOM; break; }
+                    hits = nh; cap_hits = nc;
+                }
+                hits[n_hits++] = idx;
+                remaining += blk.n - 1;
+            } else {
+                remaining += blk.n;
+            }
+            dict_free(&blk);
+        }
+        bpt_cursor_close(c);
+        if (!e && r < 0) e = r;
+
+        /* Rewrite each block that held the doc (cursor closed: writes ok). */
+        for (int h = 0; h < n_hits && !e; h++) {
+            bpt_key bk = tkey_block(&k, hits[h]);
+            int bf;
+            if ((e = bpt_search(index, &bk, &bf, &vp, &vl))) break;
+            if (!bf) continue;
+            dict blk; dict_init(&blk);
+            e = decode_obj(vp, vl, &blk);
+            if (!e) {
+                dict_remove(&blk, doc_id, doc_id_len);
+                e = write_block(index, b, &k, hits[h], &blk, 0, blk.n);
+            }
+            dict_free(&blk);
+        }
+        free(hits);
+
+        if (!e && remaining == 0) {
+            for (int i = 0; i < n && !e; i++) {
+                bpt_key bk = tkey_block(&k, i);
+                e = bpt_delete(index, &bk);
+            }
+            if (!e) e = bpt_delete(index, &hk);
+        }
+    } else {
+        bpt_key tk = str_key(term, tlen);
+        e = bpt_search(index, &tk, &found, &vp, &vl);
+        if (!e && found) {
+            dict post; dict_init(&post);
+            e = decode_obj(vp, vl, &post);
+            if (!e) {
+                dict_remove(&post, doc_id, doc_id_len);
+                if (post.n == 0) {
+                    e = bpt_delete(index, &tk);
+                } else {
+                    const uint8_t *data; size_t dlen;
+                    if (!(e = encode_obj(b, &post, &data, &dlen)))
+                        e = bpt_add(index, &tk, data, (uint32_t)dlen);
+                }
+            }
+            dict_free(&post);
+        }
+    }
+    tkey_free(&k);
+    return e;
 }
 
 /* ---- add ------------------------------------------------------------ */
@@ -222,21 +537,9 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths,
     bj_builder *b = bj_builder_new();
     if (!b) { dict_free(&tf); return BJ_ERR_OOM; }
 
-    /* Postings: for each term, merge in this doc's frequency. */
-    for (int i = 0; i < tf.n && !e; i++) {
-        bpt_key kt = str_key(tf.keys[i], tf.klen[i]);
-        int found; const uint8_t *vp; size_t vl;
-        if ((e = bpt_search(index, &kt, &found, &vp, &vl))) break;
-        dict post; dict_init(&post);
-        if (found) e = decode_obj(vp, vl, &post);
-        if (!e) e = dict_set(&post, doc_id, doc_id_len, tf.vals[i]);
-        if (!e) {
-            const uint8_t *data; size_t dlen;
-            if (!(e = encode_obj(b, &post, &data, &dlen)))
-                e = bpt_add(index, &kt, data, (uint32_t)dlen);
-        }
-        dict_free(&post);
-    }
+    /* Postings: merge each term's (docId, tf) into its active block. */
+    for (int i = 0; i < tf.n && !e; i++)
+        e = post_add(index, b, tf.keys[i], tf.klen[i], doc_id, doc_id_len, tf.vals[i]);
 
     /* documentTerms: merge new terms over existing. */
     if (!e) {
@@ -290,24 +593,8 @@ int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths,
     bj_builder *b = bj_builder_new();
     if (!b) { dict_free(&terms); return BJ_ERR_OOM; }
 
-    for (int i = 0; i < terms.n && !e; i++) {
-        bpt_key kt = str_key(terms.keys[i], terms.klen[i]);
-        int f2; const uint8_t *vp2; size_t vl2;
-        if ((e = bpt_search(index, &kt, &f2, &vp2, &vl2))) break;
-        dict post; dict_init(&post);
-        if (f2) e = decode_obj(vp2, vl2, &post);
-        if (!e) {
-            dict_remove(&post, doc_id, doc_id_len);
-            if (post.n == 0) {
-                e = bpt_delete(index, &kt);
-            } else {
-                const uint8_t *data; size_t dlen;
-                if (!(e = encode_obj(b, &post, &data, &dlen)))
-                    e = bpt_add(index, &kt, data, (uint32_t)dlen);
-            }
-        }
-        dict_free(&post);
-    }
+    for (int i = 0; i < terms.n && !e; i++)
+        e = post_remove(index, b, terms.keys[i], terms.klen[i], doc_id, doc_id_len);
 
     if (!e) e = bpt_delete(doc_terms, &kd);
     if (!e) e = bpt_delete(doc_lengths, &kd);
@@ -435,37 +722,20 @@ int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
     int total = 0;
     e = load_lengths(doc_lengths, &lenmap, &total);
 
-    double *idf = calloc((size_t)tf.n, sizeof(double));
     dict scores; dict_init(&scores);
-    if (!idf) e = BJ_ERR_OOM;
 
-    /* idf per term */
+    /* idf + tf*idf accumulation, decoding each term's postings once. */
     for (int t = 0; t < tf.n && !e; t++) {
-        bpt_key kt = str_key(tf.keys[t], tf.klen[t]);
-        int found; const uint8_t *vp; size_t vl;
-        if ((e = bpt_search(index, &kt, &found, &vp, &vl))) break;
-        if (found) {
-            dict post; dict_init(&post);
-            e = decode_obj(vp, vl, &post);
-            if (!e && post.n > 0) idf[t] = log((double)total / (double)post.n);
-            dict_free(&post);
-        }
-    }
-
-    /* accumulate tf*idf per doc */
-    for (int t = 0; t < tf.n && !e; t++) {
-        bpt_key kt = str_key(tf.keys[t], tf.klen[t]);
-        int found; const uint8_t *vp; size_t vl;
-        if ((e = bpt_search(index, &kt, &found, &vp, &vl))) break;
-        if (!found) continue;
         dict post; dict_init(&post);
-        e = decode_obj(vp, vl, &post);
+        int nb;
+        e = load_postings(index, tf.keys[t], tf.klen[t], &post, &nb);
+        double idf = (!e && post.n > 0) ? log((double)total / (double)post.n) : 0;
         for (int j = 0; j < post.n && !e; j++) {
             double dl = length_of(&lenmap, post.keys[j], post.klen[j]);
             double tfv = post.vals[j] / dl;
             int si = dict_find(&scores, post.keys[j], post.klen[j]);
             double prev = si >= 0 ? scores.vals[si] : 0;
-            e = dict_set(&scores, post.keys[j], post.klen[j], prev + tfv * idf[t]);
+            e = dict_set(&scores, post.keys[j], post.klen[j], prev + tfv * idf);
         }
         dict_free(&post);
     }
@@ -519,11 +789,34 @@ int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
         }
     }
 
-    free(idf);
     dict_free(&scores);
     dict_free(&lenmap);
     dict_free(&tf);
     return e;
+}
+
+/* ---- term count ------------------------------------------------------ */
+
+/*
+ * Count distinct terms: one key per term identifies it — the block header
+ * (ends with the '\0' suffix) or a legacy blob key (contains no '\0' at
+ * all). Block keys ('\0' followed by hex digits) are skipped.
+ */
+int tix_term_count(bpt *index, int64_t *out) {
+    bpt_cursor *c = bpt_cursor_open(index, NULL, NULL);
+    if (!c) return BJ_ERR_OOM;
+    int64_t n = 0;
+    int r;
+    bpt_key k; const uint8_t *v; size_t vl;
+    while ((r = bpt_cursor_next(c, &k, &v, &vl)) == 1) {
+        if (!k.is_string) continue;
+        if (k.str_len && k.str[k.str_len - 1] == 0) n++;                 /* header */
+        else if (!memchr(k.str, 0, k.str_len)) n++;                      /* legacy */
+    }
+    bpt_cursor_close(c);
+    if (r < 0) return r;
+    *out = n;
+    return BJ_OK;
 }
 
 /* ---- query (requireAll) --------------------------------------------- */
@@ -540,19 +833,15 @@ int tix_query_all(bpt *index, bpt *doc_terms, bpt *doc_lengths,
     /* Candidate set = docIds of the first term's postings (in order). */
     dict cand; dict_init(&cand);
     {
-        bpt_key k0 = str_key(tf.keys[0], tf.klen[0]);
-        int found; const uint8_t *vp; size_t vl;
-        e = bpt_search(index, &k0, &found, &vp, &vl);
-        if (!e && found) e = decode_obj(vp, vl, &cand);
+        int nb;
+        e = load_postings(index, tf.keys[0], tf.klen[0], &cand, &nb);
     }
 
     /* Intersect with each remaining term. */
     for (int t = 1; t < tf.n && !e && cand.n > 0; t++) {
-        bpt_key kt = str_key(tf.keys[t], tf.klen[t]);
-        int found; const uint8_t *vp; size_t vl;
-        if ((e = bpt_search(index, &kt, &found, &vp, &vl))) break;
         dict setT; dict_init(&setT);
-        if (found) e = decode_obj(vp, vl, &setT);
+        int nb;
+        e = load_postings(index, tf.keys[t], tf.klen[t], &setT, &nb);
         int w = 0;
         for (int i = 0; i < cand.n; i++) {
             if (dict_find(&setT, cand.keys[i], cand.klen[i]) < 0) {

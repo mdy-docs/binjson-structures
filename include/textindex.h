@@ -57,6 +57,11 @@ int tix_query_all(bpt *index, bpt *doc_terms, bpt *doc_lengths,
                   const char *query, int query_len,
                   uint8_t **out, size_t *out_len);
 
+/* Number of distinct terms in the index. Postings are block-partitioned
+ * (several tree keys per term), so this scans and classifies keys rather
+ * than returning the tree size. */
+int tix_term_count(bpt *index, int64_t *out);
+
 #ifdef __cplusplus
 }
 #endif

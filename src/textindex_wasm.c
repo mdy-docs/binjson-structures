@@ -56,5 +56,11 @@ EMSCRIPTEN_KEEPALIVE int tixw_query_all(bpt *index, bpt *doc_terms, bpt *doc_len
     return tix_query_all(index, doc_terms, doc_lengths, query, query_len, &g_out, &g_out_len);
 }
 
+EMSCRIPTEN_KEEPALIVE double tixw_term_count(bpt *index) {
+    int64_t n = 0;
+    int e = tix_term_count(index, &n);
+    return e ? (double)e : (double)n;
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *tixw_out_ptr(void) { return g_out; }
 EMSCRIPTEN_KEEPALIVE int            tixw_out_len(void) { return (int)g_out_len; }
