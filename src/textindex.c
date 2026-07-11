@@ -137,15 +137,23 @@ static int is_stopword(const char *w, int len) {
     return 0;
 }
 
+/* ASCII word characters plus every UTF-8 lead/continuation byte, so
+ * non-ASCII text (accented Latin, Cyrillic, CJK, ...) forms tokens instead
+ * of being silently dropped — the JS reference's \w keeps the old ASCII
+ * behavior. Whole runs are one token; no Unicode segmentation. */
 static int is_word_char(unsigned char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '_';
+           (c >= '0' && c <= '9') || c == '_' || c >= 0x80;
 }
 
 /*
- * Tokenize `text`: lowercase, split on non-word runs, drop stop words, Porter-
- * stem each surviving token and count stem frequencies into `out` (insertion
- * order = first-seen order, matching the reference's Map/object semantics).
+ * Tokenize `text`: lowercase ASCII letters, split on non-word runs, drop
+ * stop words, Porter-stem each surviving token and count stem frequencies
+ * into `out` (insertion order = first-seen order, matching the reference's
+ * Map/object semantics). Tokens containing non-ASCII bytes are indexed
+ * verbatim: the Porter stemmer is English-only, and byte-level lowercasing
+ * or suffix-stripping inside multibyte sequences would corrupt them (so no
+ * case or accent folding beyond ASCII either).
  */
 static int tokenize_count(const char *text, int len, dict *out) {
     char *low = NULL, *stem = NULL;
@@ -157,12 +165,18 @@ static int tokenize_count(const char *text, int len, dict *out) {
         while (i < len && is_word_char((unsigned char)text[i])) i++;
         int wlen = i - s;
         if (wlen + 1 > lowcap) { lowcap = wlen + 1; char *t = realloc(low, (size_t)lowcap); if (!t) { e = BJ_ERR_OOM; break; } low = t; }
+        int ascii = 1;
         for (int j = 0; j < wlen; j++) {
             char c = text[s + j];
+            if ((unsigned char)c >= 0x80) ascii = 0;
             if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
             low[j] = c;
         }
         if (is_stopword(low, wlen)) continue;
+        if (!ascii) {
+            if ((e = dict_inc(out, low, wlen))) break;
+            continue;
+        }
         if (wlen + 2 > stemcap) { stemcap = wlen + 2; char *t = realloc(stem, (size_t)stemcap); if (!t) { e = BJ_ERR_OOM; break; } stem = t; }
         int slen = stemmer_stem(low, wlen, stem);
         if ((e = dict_inc(out, stem, slen))) break;
