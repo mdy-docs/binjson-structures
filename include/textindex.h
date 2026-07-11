@@ -9,7 +9,7 @@
  * The trees (and their append-only file images) are owned by the host, which
  * passes the three handles into every operation; this file implements the
  * indexing/query logic - tokenization, stop-word filtering, Porter stemming
- * (stemmer.h) and TF-IDF relevance scoring - and reads/writes the tree values
+ * (stemmer.h) and BM25 relevance scoring - and reads/writes the tree values
  * as binjson blobs (binjson.h).
  *
  * All keys are strings (docIds and stems), matching how textindex.js is used.

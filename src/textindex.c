@@ -1,10 +1,11 @@
 /*
  * textindex.c - C port of src/textindex.js. See textindex.h.
  *
- * Tokenization, stop words, stemming and TF-IDF scoring are ported faithfully;
- * tree values (postings / term maps / lengths) are read and written as binjson
- * blobs. Small string->number dictionaries (insertion-ordered) mirror the JS
- * objects/Maps the reference builds.
+ * Tokenization, stop words and stemming follow the JS reference (plus UTF-8
+ * word tokens, §4.8); scoring is BM25 rather than the reference's TF-IDF
+ * (§4.9). Tree values (postings / term maps / lengths) are read and written
+ * as binjson blobs. Small string->number dictionaries (insertion-ordered)
+ * mirror the JS objects/Maps the reference builds.
  */
 #include "textindex.h"
 #include "bjcursor.h"
@@ -540,6 +541,76 @@ static int post_remove(bpt *index, bj_builder *b, const char *term, int tlen,
     return e;
 }
 
+/* ---- corpus statistics (for BM25) ------------------------------------ */
+
+/*
+ * BM25 needs the average document length. The corpus length *sum* is kept
+ * under a reserved key in the index tree (stems never start with NUL, and
+ * tix_term_count skips NUL-bearing keys) and maintained incrementally by
+ * add/remove from the old-length information those paths already have —
+ * queries stay free of corpus scans (§4.4). Indexes written before this
+ * key existed fall back to one scan of documentLengths: queries compute it
+ * without writing; the next add computes and persists it.
+ */
+#define TIX_BM25_K1 1.2
+#define TIX_BM25_B  0.75
+
+static const char TIX_STATS_KEY[4] = { 0, 's', 'u', 'm' };
+
+static int get_corpus_len(bpt *index, double *sum, int *have) {
+    *have = 0;
+    *sum = 0;
+    bpt_key k = str_key(TIX_STATS_KEY, 4);
+    int found; const uint8_t *vp; size_t vl;
+    int e = bpt_search(index, &k, &found, &vp, &vl);
+    if (e || !found) return e;
+    cur c = { vp, vl, 0 };
+    if ((e = read_number(&c, sum))) return e;
+    if (!(*sum >= 0)) *sum = 0;   /* hostile value: clamp */
+    *have = 1;
+    return BJ_OK;
+}
+
+static int scan_corpus_len(bpt *doc_lengths, double *sum) {
+    *sum = 0;
+    bpt_cursor *c = bpt_cursor_open(doc_lengths, NULL, NULL);
+    if (!c) return BJ_ERR_OOM;
+    int r;
+    bpt_key k; const uint8_t *v; size_t vl;
+    while ((r = bpt_cursor_next(c, &k, &v, &vl)) == 1) {
+        cur cc = { v, vl, 0 };
+        double d;
+        if (read_number(&cc, &d) == BJ_OK && d > 0) *sum += d;
+    }
+    bpt_cursor_close(c);
+    return r < 0 ? r : BJ_OK;
+}
+
+static int put_corpus_len(bpt *index, bj_builder *b, double sum) {
+    bj_builder_reset(b);
+    bj_put_float(b, sum);
+    int e = bj_builder_error(b);
+    if (e) return e;
+    size_t dlen;
+    const uint8_t *d = bj_builder_data(b, &dlen);
+    if (!d) return BJ_ERR_STATE;
+    bpt_key k = str_key(TIX_STATS_KEY, 4);
+    return bpt_add(index, &k, d, (uint32_t)dlen);
+}
+
+/* Apply `delta` to the stored sum; a legacy index without the key gets it
+ * computed from documentLengths (already reflecting the current operation,
+ * so the delta must not be applied on that path). */
+static int bump_corpus_len(bpt *index, bpt *doc_lengths, bj_builder *b, double delta) {
+    double sum; int have;
+    int e = get_corpus_len(index, &sum, &have);
+    if (e) return e;
+    if (have) sum += delta;
+    else if ((e = scan_corpus_len(doc_lengths, &sum))) return e;
+    if (sum < 0) sum = 0;
+    return put_corpus_len(index, b, sum);
+}
+
 /* ---- Cross-tree commit journal (crash atomicity) ---------------------- */
 
 /*
@@ -675,6 +746,7 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
      * remove-then-add for a database index). Terms present in both
      * versions are simply overwritten by post_add below.
      */
+    double old_len = 0;
     {
         bpt_key kd = str_key(doc_id, doc_id_len);
         int found; const uint8_t *vp; size_t vl;
@@ -683,6 +755,7 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
             dict old; dict_init(&old);
             e = decode_obj(vp, vl, &old);
             for (int i = 0; i < old.n && !e; i++) {
+                old_len += old.vals[i];
                 if (dict_find(&tf, old.keys[i], old.klen[i]) >= 0) continue;
                 e = post_remove(index, b, old.keys[i], old.klen[i], doc_id, doc_id_len);
             }
@@ -713,6 +786,7 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
                 else e = bpt_add(doc_lengths, &kd, data2, (uint32_t)dlen2);
             }
         }
+        if (!e) e = bump_corpus_len(index, doc_lengths, b, doc_len - old_len);
     }
 
     if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
@@ -743,6 +817,11 @@ int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journa
 
     if (!e) e = bpt_delete(doc_terms, &kd);
     if (!e) e = bpt_delete(doc_lengths, &kd);
+    if (!e) {
+        double old_len = 0;
+        for (int i = 0; i < terms.n; i++) old_len += terms.vals[i];
+        e = bump_corpus_len(index, doc_lengths, b, -old_len);
+    }
     if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
     if (!e) *removed = 1;
 
@@ -847,24 +926,47 @@ int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
      * not a tree scan. */
     double total = (double)bpt_size(doc_lengths);
 
+    /* Average document length for BM25's length normalization: from the
+     * incrementally maintained sum, or one scan on legacy indexes (a query
+     * never writes, so the scan is not persisted here). */
+    double avgdl = 1;
+    if (!e && total > 0) {
+        double sum; int have;
+        e = get_corpus_len(index, &sum, &have);
+        if (!e && !have) e = scan_corpus_len(doc_lengths, &sum);
+        if (!e && sum > 0) avgdl = sum / total;
+    }
+
     dict lenmap; dict_init(&lenmap);   /* lazily fetched doc lengths */
     dict scores; dict_init(&scores);
     dict matches; dict_init(&matches); /* docId -> # query terms matched */
 
-    /* idf + tf*idf accumulation, decoding each term's postings once. */
+    /*
+     * BM25 (k1, b), one merged-postings decode per term:
+     *   idf  = ln(1 + (N - df + 0.5) / (df + 0.5))       (always positive)
+     *   term = idf * tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl))
+     * plus the reference's coverage boost applied below.
+     */
     for (int t = 0; t < tf.n && !e; t++) {
         dict post; dict_init(&post);
         int nb;
         e = load_postings(index, tf.keys[t], tf.klen[t], &post, &nb);
-        double idf = (!e && post.n > 0) ? log(total / (double)post.n) : 0;
+        double idf = 0;
+        if (!e && post.n > 0) {
+            double arg = (total - (double)post.n + 0.5) / ((double)post.n + 0.5);
+            if (arg < 0) arg = 0;   /* hostile files: df can exceed N */
+            idf = log(1.0 + arg);
+        }
         for (int j = 0; j < post.n && !e; j++) {
             double dl;
             if ((e = doc_length(doc_lengths, &lenmap, post.keys[j], post.klen[j], &dl)))
                 break;
-            double tfv = post.vals[j] / dl;
+            double tfv = post.vals[j];
+            double denom = tfv + TIX_BM25_K1 * (1 - TIX_BM25_B + TIX_BM25_B * dl / avgdl);
+            double contrib = denom > 0 ? idf * tfv * (TIX_BM25_K1 + 1) / denom : 0;
             int si = dict_find(&scores, post.keys[j], post.klen[j]);
             double prev = si >= 0 ? scores.vals[si] : 0;
-            if ((e = dict_set(&scores, post.keys[j], post.klen[j], prev + tfv * idf)))
+            if ((e = dict_set(&scores, post.keys[j], post.klen[j], prev + contrib)))
                 break;
             /* Each doc appears at most once per merged posting, so this
              * counts distinct matched query terms per doc. */
