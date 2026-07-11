@@ -16,6 +16,8 @@
 #include "hostio.h"
 #include "geo.h"
 
+#include <limits.h>
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #else
@@ -106,6 +108,9 @@ EMSCRIPTEN_KEEPALIVE int rtw_nearest(rtree *t, double lat, double lng, int k) {
 EMSCRIPTEN_KEEPALIVE const uint8_t *rtw_out_ptr(rtree *t) {
     size_t n; return rtree_out(t, &n);
 }
+/* Length of the last output, or BJ_ERR_INT_RANGE if it cannot cross the
+ * boundary as an int (>= 2 GB) instead of a silently truncated number. */
 EMSCRIPTEN_KEEPALIVE int rtw_out_len(rtree *t) {
-    size_t n; rtree_out(t, &n); return (int)n;
+    size_t n; rtree_out(t, &n);
+    return n > INT_MAX ? BJ_ERR_INT_RANGE : (int)n;
 }

@@ -6,10 +6,11 @@
  * as an opaque integer handle (WASM pointers are 32-bit ints). All operations
  * take that handle plus a marshalled key: (type, num, strPtr, strLen) where
  * type 0 = number and type 1 = string. Values are pre-encoded binjson blobs
- * (ptr+len) produced by the JS side. Outputs (search value / entries / range)
- * are exposed through the tree's own output buffer via bptw_out_ptr /
- * bptw_out_len. All file reads and writes flow through the fd's handle; no
- * copy of the file lives in WASM memory.
+ * (ptr+len) produced by the JS side. Outputs (search value / entries / range /
+ * cursor batches / boundaries) live in the tree's own output buffer, read via
+ * bptw_out_ptr(t) / bptw_out_len(t) — scoped to the handle, so operations on
+ * one tree never clobber another's unread result. All file reads and writes
+ * flow through the fd's handle; no copy of the file lives in WASM memory.
  *
  * Memory: heap growth may swap HEAPU8's ArrayBuffer, so JS must re-read HEAPU8
  * after any call before touching a returned pointer.
@@ -17,6 +18,7 @@
 #include "bplustree.h"
 #include "hostio.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 #ifdef __EMSCRIPTEN__
@@ -34,11 +36,6 @@ static bpt_key make_key(int type, double num, const uint8_t *sptr, int slen) {
     return k;
 }
 
-/* The last search/entries/range output for a tree lives in the tree's own
- * buffer; JS reads it right after the call that produced it. */
-static const uint8_t *g_out_ptr = NULL;
-static size_t         g_out_len = 0;
-
 EMSCRIPTEN_KEEPALIVE bpt *bptw_create(int fd, int order) {
     bj_io io = bjio_host(fd);
     return bpt_create(&io, order);
@@ -53,8 +50,8 @@ EMSCRIPTEN_KEEPALIVE bpt *bptw_open_at(int fd, double len) {
 }
 
 EMSCRIPTEN_KEEPALIVE int bptw_boundaries(bpt *t) {
-    g_out_ptr = NULL; g_out_len = 0;
-    return bpt_boundaries(t, &g_out_ptr, &g_out_len);
+    const uint8_t *p; size_t n;
+    return bpt_boundaries(t, &p, &n);
 }
 
 EMSCRIPTEN_KEEPALIVE int bptw_is_snapshot(bpt *t) {
@@ -85,15 +82,15 @@ EMSCRIPTEN_KEEPALIVE int bptw_search(bpt *t, int ktype, double knum,
                                      const uint8_t *kptr, int klen) {
     bpt_key k = make_key(ktype, knum, kptr, klen);
     int found = 0;
-    g_out_ptr = NULL; g_out_len = 0;
-    int e = bpt_search(t, &k, &found, &g_out_ptr, &g_out_len);
+    const uint8_t *p; size_t n;
+    int e = bpt_search(t, &k, &found, &p, &n);
     if (e) return e;
     return found ? 1 : 0;
 }
 
 EMSCRIPTEN_KEEPALIVE int bptw_entries(bpt *t) {
-    g_out_ptr = NULL; g_out_len = 0;
-    return bpt_entries(t, &g_out_ptr, &g_out_len);
+    const uint8_t *p; size_t n;
+    return bpt_entries(t, &p, &n);
 }
 
 EMSCRIPTEN_KEEPALIVE int bptw_range(bpt *t,
@@ -101,8 +98,8 @@ EMSCRIPTEN_KEEPALIVE int bptw_range(bpt *t,
                                     int maxType, double maxNum, const uint8_t *maxPtr, int maxLen) {
     bpt_key mn = make_key(minType, minNum, minPtr, minLen);
     bpt_key mx = make_key(maxType, maxNum, maxPtr, maxLen);
-    g_out_ptr = NULL; g_out_len = 0;
-    return bpt_range(t, &mn, &mx, &g_out_ptr, &g_out_len);
+    const uint8_t *p; size_t n;
+    return bpt_range(t, &mn, &mx, &p, &n);
 }
 
 /* Height (>= 0) or a negative error code. */
@@ -134,11 +131,12 @@ EMSCRIPTEN_KEEPALIVE bpt_cursor *bptw_cursor_open(bpt *t,
     return bpt_cursor_open(t, pmn, pmx);
 }
 
+/* The batch lands in the buffer of the tree the cursor was opened on; read
+ * it via bptw_out_ptr/len with that tree's handle. */
 EMSCRIPTEN_KEEPALIVE int bptw_cursor_next(bpt_cursor *cur, int max_bytes) {
-    g_out_ptr = NULL; g_out_len = 0;
     int count = 0;
-    int e = bpt_cursor_next_batch(cur, (size_t)max_bytes, &count,
-                                  &g_out_ptr, &g_out_len);
+    const uint8_t *p; size_t n;
+    int e = bpt_cursor_next_batch(cur, (size_t)max_bytes, &count, &p, &n);
     return e ? e : count;
 }
 
@@ -151,5 +149,12 @@ EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return (double)bpt_root(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return (double)bpt_next_id(t); }
 EMSCRIPTEN_KEEPALIVE int    bptw_order(bpt *t)   { return bpt_order(t); }
 
-EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_out_ptr(void) { return g_out_ptr; }
-EMSCRIPTEN_KEEPALIVE int            bptw_out_len(void) { return (int)g_out_len; }
+EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_out_ptr(bpt *t) {
+    size_t n; return bpt_out(t, &n);
+}
+/* Length of the last output, or BJ_ERR_INT_RANGE if it cannot cross the
+ * boundary as an int (>= 2 GB) instead of a silently truncated number. */
+EMSCRIPTEN_KEEPALIVE int bptw_out_len(bpt *t) {
+    size_t n; bpt_out(t, &n);
+    return n > INT_MAX ? BJ_ERR_INT_RANGE : (int)n;
+}

@@ -15,6 +15,8 @@
 #include "textlog.h"
 #include "hostio.h"
 
+#include <limits.h>
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #else
@@ -59,6 +61,9 @@ EMSCRIPTEN_KEEPALIVE int    tlw_diffs_per_snapshot(textlog *t) { return textlog_
 EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_out_ptr(textlog *t) {
     size_t n; return textlog_out(t, &n);
 }
+/* Length of the last output, or BJ_ERR_INT_RANGE if it cannot cross the
+ * boundary as an int (>= 2 GB) instead of a silently truncated number. */
 EMSCRIPTEN_KEEPALIVE int tlw_out_len(textlog *t) {
-    size_t n; textlog_out(t, &n); return (int)n;
+    size_t n; textlog_out(t, &n);
+    return n > INT_MAX ? BJ_ERR_INT_RANGE : (int)n;
 }

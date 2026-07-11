@@ -54,6 +54,11 @@ uint64_t       bpt_root(const bpt *t);
 uint64_t       bpt_next_id(const bpt *t);
 int            bpt_order(const bpt *t);
 
+/* The last search/entries/range/batch output; writes its length through
+ * *len. Valid until the next operation on this tree — each tree owns its
+ * buffer, so operations on other trees never disturb it. */
+const uint8_t *bpt_out(const bpt *t, size_t *len);
+
 /* Insert/update. `val`/`val_len` is one pre-encoded binjson value (opaque).
  * Non-finite numeric keys are rejected with BJ_ERR_STATE (NaN compares
  * equal to everything and would silently overwrite an arbitrary entry). */

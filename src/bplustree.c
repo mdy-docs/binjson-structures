@@ -1554,6 +1554,7 @@ int bpt_rewind(bpt *t, uint64_t len) {
     return BJ_OK;
 }
 
+const uint8_t *bpt_out(const bpt *t, size_t *len) { if (len) *len = t->out.len; return t->out.data; }
 int64_t        bpt_size(const bpt *t)     { return t->size; }
 uint64_t       bpt_root(const bpt *t)     { return t->root; }
 uint64_t       bpt_next_id(const bpt *t)  { return t->next_id; }

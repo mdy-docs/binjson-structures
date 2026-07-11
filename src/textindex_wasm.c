@@ -3,9 +3,10 @@
  *
  * The three B+ trees are created/loaded via the bplustree glue (bptw_*, also
  * exported from this module) and their opaque handles are passed into the
- * textindex operations here. Query outputs are freshly malloc'd binjson buffers
- * held in a module-static slot, read by JS via tixw_out_ptr / tixw_out_len and
- * freed on the next query.
+ * textindex operations here. Query outputs are freshly malloc'd binjson
+ * buffers held in a per-index output slot (tixw_out_new / tixw_out_free, one
+ * per open index so two indexes never clobber each other's unread result),
+ * read by JS via tixw_out_ptr / tixw_out_len and freed on the next query.
  *
  * The mutating operations take a journal file descriptor (a registered
  * Module.bjioHandles slot, like the tree fds) for cross-tree crash atomicity;
@@ -18,6 +19,7 @@
 #include "textindex.h"
 #include "hostio.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 #ifdef __EMSCRIPTEN__
@@ -26,10 +28,19 @@
 #define EMSCRIPTEN_KEEPALIVE
 #endif
 
-static uint8_t *g_out = NULL;
-static size_t   g_out_len = 0;
+/* One query-output slot per open index. */
+typedef struct { uint8_t *buf; size_t len; } tixw_out;
 
-static void reset_out(void) { free(g_out); g_out = NULL; g_out_len = 0; }
+EMSCRIPTEN_KEEPALIVE tixw_out *tixw_out_new(void) {
+    return (tixw_out *)calloc(1, sizeof(tixw_out));
+}
+EMSCRIPTEN_KEEPALIVE void tixw_out_free(tixw_out *o) {
+    if (!o) return;
+    free(o->buf);
+    free(o);
+}
+
+static void reset_out(tixw_out *o) { free(o->buf); o->buf = NULL; o->len = 0; }
 
 EMSCRIPTEN_KEEPALIVE int tixw_recover(int jfd, bpt *index, bpt *doc_terms,
                                       bpt *doc_lengths) {
@@ -67,16 +78,16 @@ EMSCRIPTEN_KEEPALIVE int tixw_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths
     return tix_clear(index, doc_terms, doc_lengths, jp);
 }
 
-EMSCRIPTEN_KEEPALIVE int tixw_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
-                                    const char *query, int query_len) {
-    reset_out();
-    return tix_query(index, doc_terms, doc_lengths, query, query_len, &g_out, &g_out_len);
+EMSCRIPTEN_KEEPALIVE int tixw_query(tixw_out *o, bpt *index, bpt *doc_terms,
+                                    bpt *doc_lengths, const char *query, int query_len) {
+    reset_out(o);
+    return tix_query(index, doc_terms, doc_lengths, query, query_len, &o->buf, &o->len);
 }
 
-EMSCRIPTEN_KEEPALIVE int tixw_query_all(bpt *index, bpt *doc_terms, bpt *doc_lengths,
-                                        const char *query, int query_len) {
-    reset_out();
-    return tix_query_all(index, doc_terms, doc_lengths, query, query_len, &g_out, &g_out_len);
+EMSCRIPTEN_KEEPALIVE int tixw_query_all(tixw_out *o, bpt *index, bpt *doc_terms,
+                                        bpt *doc_lengths, const char *query, int query_len) {
+    reset_out(o);
+    return tix_query_all(index, doc_terms, doc_lengths, query, query_len, &o->buf, &o->len);
 }
 
 EMSCRIPTEN_KEEPALIVE double tixw_term_count(bpt *index) {
@@ -85,5 +96,9 @@ EMSCRIPTEN_KEEPALIVE double tixw_term_count(bpt *index) {
     return e ? (double)e : (double)n;
 }
 
-EMSCRIPTEN_KEEPALIVE const uint8_t *tixw_out_ptr(void) { return g_out; }
-EMSCRIPTEN_KEEPALIVE int            tixw_out_len(void) { return (int)g_out_len; }
+EMSCRIPTEN_KEEPALIVE const uint8_t *tixw_out_ptr(tixw_out *o) { return o->buf; }
+/* Length of the slot's last output, or BJ_ERR_INT_RANGE if it cannot cross
+ * the boundary as an int (>= 2 GB) instead of a silently truncated number. */
+EMSCRIPTEN_KEEPALIVE int tixw_out_len(tixw_out *o) {
+    return o->len > INT_MAX ? BJ_ERR_INT_RANGE : (int)o->len;
+}
