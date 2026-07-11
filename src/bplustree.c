@@ -78,6 +78,19 @@ static int key_cmp(const bpt_key *a, const bpt_key *b) {
 }
 static int key_eq(const bpt_key *a, const bpt_key *b) { return key_cmp(a, b) == 0; }
 
+/*
+ * NaN compares equal to everything in key_cmp (both < checks are false), so
+ * a NaN key would silently overwrite or match arbitrary entries. Stored
+ * keys must be finite; range/cursor bounds only exclude NaN — ±infinity is
+ * a legitimate unbounded query.
+ */
+static int key_storable(const bpt_key *k) {
+    return k->is_string || isfinite(k->num);
+}
+static int bound_valid(const bpt_key *k) {
+    return k->is_string || !isnan(k->num);
+}
+
 static int key_copy(bpt_key *dst, const bpt_key *src) {
     dst->is_string = src->is_string;
     dst->num = src->num;
@@ -576,7 +589,7 @@ static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vle
  * the in-memory state is rolled back, leaving the file untouched.
  */
 int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
-    if (t->read_only) return BJ_ERR_STATE;
+    if (t->read_only || !key_storable(key)) return BJ_ERR_STATE;
     uint64_t root = t->root, next_id = t->next_id;
     int64_t size = t->size;
     int e = add_root(t, key, val, vlen);
@@ -668,7 +681,7 @@ static int delete_root(bpt *t, const bpt_key *key) {
 }
 
 int bpt_delete(bpt *t, const bpt_key *key) {
-    if (t->read_only) return BJ_ERR_STATE;
+    if (t->read_only || !key_storable(key)) return BJ_ERR_STATE;
     uint64_t root = t->root, next_id = t->next_id;
     int64_t size = t->size;
     int e = delete_root(t, key);
@@ -684,6 +697,7 @@ int bpt_delete(bpt *t, const bpt_key *key) {
 
 int bpt_search(bpt *t, const bpt_key *key, int *found,
                const uint8_t **out_ptr, size_t *out_len) {
+    if (!key_storable(key)) return BJ_ERR_STATE;
     uint64_t ptr = t->root;
     for (int depth = 0; ; depth++) {
         if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
@@ -776,6 +790,7 @@ int bpt_entries(bpt *t, const uint8_t **out_ptr, size_t *out_len) {
 }
 int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
               const uint8_t **out_ptr, size_t *out_len) {
+    if (!bound_valid(min) || !bound_valid(max)) return BJ_ERR_STATE;
     return collect_to_out(t, 1, min, max, out_ptr, out_len);
 }
 
@@ -836,6 +851,7 @@ static int cursor_descend(bpt_cursor *c, uint64_t ptr, int seek_min) {
 }
 
 bpt_cursor *bpt_cursor_open(bpt *t, const bpt_key *min, const bpt_key *max) {
+    if ((min && !bound_valid(min)) || (max && !bound_valid(max))) return NULL;
     bpt_cursor *c = (bpt_cursor *)calloc(1, sizeof(bpt_cursor));
     if (!c) return NULL;
     c->t = t;

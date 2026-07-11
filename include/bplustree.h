@@ -54,7 +54,9 @@ uint64_t       bpt_root(const bpt *t);
 uint64_t       bpt_next_id(const bpt *t);
 int            bpt_order(const bpt *t);
 
-/* Insert/update. `val`/`val_len` is one pre-encoded binjson value (opaque). */
+/* Insert/update. `val`/`val_len` is one pre-encoded binjson value (opaque).
+ * Non-finite numeric keys are rejected with BJ_ERR_STATE (NaN compares
+ * equal to everything and would silently overwrite an arbitrary entry). */
 int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t val_len);
 /* Delete a key (no-op if absent). */
 int bpt_delete(bpt *t, const bpt_key *key);
@@ -143,7 +145,8 @@ int bpt_is_snapshot(const bpt *t);
 typedef struct bpt_cursor bpt_cursor;
 
 /* Open a cursor over min <= key <= max; either bound may be NULL for an open
- * end (both NULL = full scan). Returns NULL on OOM or unreadable root. */
+ * end (both NULL = full scan; ±infinity bounds are also fine, NaN is not).
+ * Returns NULL on OOM, invalid bound, or unreadable root. */
 bpt_cursor *bpt_cursor_open(bpt *t, const bpt_key *min, const bpt_key *max);
 /*
  * Advance to the next entry. Returns 1 with *key / *val / *val_len exposing
