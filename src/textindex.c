@@ -781,36 +781,29 @@ int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal
 
 /* ---- query helpers -------------------------------------------------- */
 
-/* Parse documentLengths entries into `lenmap` (docId -> max(length,1)); returns
- * the document count through *total. */
-static int load_lengths(bpt *doc_lengths, dict *lenmap, int *total) {
-    const uint8_t *ap; size_t al;
-    int e = bpt_entries(doc_lengths, &ap, &al);
-    if (e) return e;
-    cur c = { ap, al, 0 };
-    uint32_t count;
-    if ((e = array_begin(&c, &count))) return e;
-    *total = (int)count;
-    for (uint32_t i = 0; i < count && !e; i++) {
-        uint32_t fields;
-        if ((e = object_begin(&c, &fields))) break;
-        const uint8_t *idp = NULL; uint32_t idl = 0; double val = 1;
-        for (uint32_t f = 0; f < fields && !e; f++) {
-            const uint8_t *kn; uint32_t klen;
-            if ((e = take_key(&c, &kn, &klen))) break;
-            if (name_eq(kn, klen, "key"))        e = take_string(&c, &idp, &idl);
-            else if (name_eq(kn, klen, "value")) e = read_number(&c, &val);
-            else                                 e = skip_value(&c);
-        }
-        if (!e) e = dict_set(lenmap, (const char *)idp, (int)idl, val == 0 ? 1 : val);
-    }
-    return e;
-}
-
-/* Look up a docId's length (default 1). */
-static double length_of(const dict *lenmap, const char *id, int idl) {
+/*
+ * A document's length, fetched on first use and memoized in `lenmap`
+ * (missing or zero -> 1, matching the reference). Queries touch only the
+ * lengths of documents that actually appear in a matched posting — the old
+ * code loaded the whole documentLengths tree (O(corpus)) per query.
+ */
+static int doc_length(bpt *doc_lengths, dict *lenmap,
+                      const char *id, int idl, double *out) {
     int i = dict_find(lenmap, id, idl);
-    return i >= 0 ? lenmap->vals[i] : 1;
+    if (i >= 0) { *out = lenmap->vals[i]; return BJ_OK; }
+    bpt_key kd = str_key(id, idl);
+    int found; const uint8_t *vp; size_t vl;
+    int e = bpt_search(doc_lengths, &kd, &found, &vp, &vl);
+    if (e) return e;
+    double v = 1;
+    if (found) {
+        cur c = { vp, vl, 0 };
+        if ((e = read_number(&c, &v))) return e;
+        if (v == 0) v = 1;
+    }
+    if ((e = dict_set(lenmap, id, idl, v))) return e;
+    *out = v;
+    return BJ_OK;
 }
 
 /* Stable sort indices [0..n) by descending score (insertion order preserved
@@ -846,46 +839,53 @@ static int emit_empty_array(uint8_t **out, size_t *out_len) {
 int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
               const char *query, int query_len,
               uint8_t **out, size_t *out_len) {
+    (void)doc_terms;   /* kept in the API; coverage no longer re-reads it */
     dict tf; dict_init(&tf); /* unique query terms (insertion order) */
     int e = tokenize_count(query, query_len, &tf);
     if (e) { dict_free(&tf); return e; }
     if (tf.n == 0) { dict_free(&tf); return emit_empty_array(out, out_len); }
 
-    dict lenmap; dict_init(&lenmap);
-    int total = 0;
-    e = load_lengths(doc_lengths, &lenmap, &total);
+    /* The doc count is the documentLengths entry count — an O(1) accessor,
+     * not a tree scan. */
+    double total = (double)bpt_size(doc_lengths);
 
+    dict lenmap; dict_init(&lenmap);   /* lazily fetched doc lengths */
     dict scores; dict_init(&scores);
+    dict matches; dict_init(&matches); /* docId -> # query terms matched */
 
     /* idf + tf*idf accumulation, decoding each term's postings once. */
     for (int t = 0; t < tf.n && !e; t++) {
         dict post; dict_init(&post);
         int nb;
         e = load_postings(index, tf.keys[t], tf.klen[t], &post, &nb);
-        double idf = (!e && post.n > 0) ? log((double)total / (double)post.n) : 0;
+        double idf = (!e && post.n > 0) ? log(total / (double)post.n) : 0;
         for (int j = 0; j < post.n && !e; j++) {
-            double dl = length_of(&lenmap, post.keys[j], post.klen[j]);
+            double dl;
+            if ((e = doc_length(doc_lengths, &lenmap, post.keys[j], post.klen[j], &dl)))
+                break;
             double tfv = post.vals[j] / dl;
             int si = dict_find(&scores, post.keys[j], post.klen[j]);
             double prev = si >= 0 ? scores.vals[si] : 0;
-            e = dict_set(&scores, post.keys[j], post.klen[j], prev + tfv * idf);
+            if ((e = dict_set(&scores, post.keys[j], post.klen[j], prev + tfv * idf)))
+                break;
+            /* Each doc appears at most once per merged posting, so this
+             * counts distinct matched query terms per doc. */
+            e = dict_inc(&matches, post.keys[j], post.klen[j]);
         }
         dict_free(&post);
     }
 
-    /* coverage boost */
+    /*
+     * Coverage boost from the counts gathered above. The reference probed
+     * each scored doc's full term map instead; since a doc's term map and
+     * its posting appearances always agree (both the C replace semantics
+     * and the JS merge update the two sides together), the results are
+     * identical — without re-reading a term map per scored document.
+     */
     for (int s = 0; s < scores.n && !e; s++) {
-        bpt_key kd = str_key(scores.keys[s], scores.klen[s]);
-        int found; const uint8_t *vp; size_t vl;
-        if ((e = bpt_search(doc_terms, &kd, &found, &vp, &vl))) break;
-        dict dterms; dict_init(&dterms);
-        if (found) e = decode_obj(vp, vl, &dterms);
-        int matching = 0;
-        for (int t = 0; t < tf.n; t++)
-            if (dict_find(&dterms, tf.keys[t], tf.klen[t]) >= 0) matching++;
-        double coverage = (double)matching / (double)tf.n;
-        scores.vals[s] *= (1.0 + coverage);
-        dict_free(&dterms);
+        int mi = dict_find(&matches, scores.keys[s], scores.klen[s]);
+        double matching = mi >= 0 ? matches.vals[mi] : 0;
+        scores.vals[s] *= (1.0 + matching / (double)tf.n);
     }
 
     /* sort + emit ARRAY of { id, score } */
@@ -923,6 +923,7 @@ int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,
     }
 
     dict_free(&scores);
+    dict_free(&matches);
     dict_free(&lenmap);
     dict_free(&tf);
     return e;
