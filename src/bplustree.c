@@ -1098,6 +1098,61 @@ int bpt_height(bpt *t, int *out_height) {
     return BJ_OK;
 }
 
+/* ---- Invariant verification (see bplustree.h for the contract) -------- */
+
+typedef struct {
+    bpt     *t;
+    int64_t  entries;      /* leaf entries seen so far            */
+    int      leaf_depth;   /* depth of the first leaf, -1 until then */
+} verify_state;
+
+/* `lower`/`upper` are the routing bounds inherited from ancestors (NULL =
+ * unbounded): every key in this subtree must satisfy lower <= k < upper. */
+static int verify_node(verify_state *vs, uint64_t ptr, const bpt_key *lower,
+                       const bpt_key *upper, int depth) {
+    if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
+    bpt_node nd;
+    int e = parse_node(vs->t, ptr, &nd);
+    if (e) return e;
+
+    /* Capacity (writers split at order) and strictly ascending keys inside
+     * the ancestors' bounds. Internal nodes with zero keys (one child) are
+     * legal: the bulk loader's rightmost spine emits them at level tails. */
+    if (nd.n_keys >= vs->t->order) e = BJ_ERR_VERIFY;
+    for (int i = 0; !e && i < nd.n_keys; i++) {
+        if (i > 0 && key_cmp(&nd.keys[i - 1], &nd.keys[i]) >= 0) e = BJ_ERR_VERIFY;
+        else if (lower && key_cmp(&nd.keys[i], lower) < 0)       e = BJ_ERR_VERIFY;
+        else if (upper && key_cmp(&nd.keys[i], upper) >= 0)      e = BJ_ERR_VERIFY;
+    }
+
+    if (!e && nd.is_leaf) {
+        if (vs->leaf_depth < 0) vs->leaf_depth = depth;
+        else if (vs->leaf_depth != depth) e = BJ_ERR_VERIFY;   /* uneven height */
+        vs->entries += nd.n_keys;
+    } else if (!e) {
+        for (int i = 0; i <= nd.n_keys && !e; i++) {
+            /* Append-only writers emit children before the node that points
+             * at them, so offsets strictly decrease downward — a forward or
+             * self pointer is corruption, and checking it here also bounds
+             * the walk against cycles. */
+            if (nd.children[i] >= ptr) { e = BJ_ERR_VERIFY; break; }
+            e = verify_node(vs, nd.children[i],
+                            i == 0 ? lower : &nd.keys[i - 1],
+                            i == nd.n_keys ? upper : &nd.keys[i],
+                            depth + 1);
+        }
+    }
+    node_free(&nd);
+    return e;
+}
+
+int bpt_verify(bpt *t) {
+    verify_state vs = { t, 0, -1 };
+    int e = verify_node(&vs, t->root, NULL, NULL, 0);
+    if (e) return e;
+    return vs.entries == t->size ? BJ_OK : BJ_ERR_VERIFY;
+}
+
 /* ---- Compaction (bulk load) ------------------------------------------ */
 
 /*

@@ -85,6 +85,24 @@ int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
 int bpt_height(bpt *t, int *out_height);
 
 /*
+ * Verify the live tree's structural invariants by walking every node: keys
+ * strictly ascending within each node and consistent with ancestor routing
+ * keys (equal-keys-route-right: a child left of separator s holds keys < s,
+ * right of it keys >= s), node sizes within capacity, every child offset
+ * strictly below the node that points at it (append-only writers emit
+ * children before parents, so this also rules out pointer cycles), all
+ * leaves at one depth, and the leaf entry total equal to the metadata size.
+ * Deliberately does NOT check min-fill or forbid zero-key internal nodes:
+ * files written by the JS reference (which never rebalances deletes) are
+ * legitimately under-filled, and the compaction bulk loader's rightmost
+ * spine legitimately emits one-child internals at level tails.
+ *
+ * Returns BJ_OK, BJ_ERR_VERIFY on a violated invariant, or an I/O or parse
+ * error. Reads every node (O(N)); works on snapshots.
+ */
+int bpt_verify(bpt *t);
+
+/*
  * Reset to a fresh empty tree: truncate the backing file and write a new
  * header + empty root + metadata. This is the O(1) "clear" for an
  * append-only file — deleting keys one at a time appends a rewritten path

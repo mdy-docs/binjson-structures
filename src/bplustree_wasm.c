@@ -109,6 +109,12 @@ EMSCRIPTEN_KEEPALIVE int bptw_height(bpt *t) {
     return e ? e : h;
 }
 
+/* 0 if every structural invariant holds, BJ_ERR_VERIFY or an I/O/parse
+ * error otherwise. */
+EMSCRIPTEN_KEEPALIVE int bptw_verify(bpt *t) {
+    return bpt_verify(t);
+}
+
 /* Stream a compacted (bulk-loaded) copy into the empty destination handle. */
 EMSCRIPTEN_KEEPALIVE int bptw_compact(bpt *t, int dst_fd) {
     bj_io dst = bjio_host(dst_fd);
