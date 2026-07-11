@@ -79,6 +79,15 @@ int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
 /* Tree height (0 for a single leaf). */
 int bpt_height(bpt *t, int *out_height);
 
+/*
+ * Reset to a fresh empty tree: truncate the backing file and write a new
+ * header + empty root + metadata. This is the O(1) "clear" for an
+ * append-only file — deleting keys one at a time appends a rewritten path
+ * per key and *grows* the file. Destroys all history: snapshots and
+ * historical boundaries of this file become invalid.
+ */
+int bpt_reset(bpt *t);
+
 /* Current length of the backing file (committed + pending bytes). */
 uint64_t bpt_file_len(const bpt *t);
 /*

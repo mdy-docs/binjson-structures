@@ -1192,6 +1192,27 @@ int bpt_compact(bpt *t, const bj_io *dst_io) {
 
 /* ---- Lifecycle & accessors ------------------------------------------ */
 
+/* Write a fresh header + empty root + metadata (shared by create/reset). */
+static int init_empty(bpt *t) {
+    int e = bjfile_append_header(&t->f, t->bld, "bplustree");
+    if (e) return e;
+    bpt_node root;
+    if ((e = node_build_leaf(&root, 0, NULL, NULL, 0, 0, 0))) {
+        node_free(&root);
+        return e;
+    }
+    t->next_id = 1;
+    t->size = 0;
+    uint64_t rp;
+    e = save_node(t, &root, &rp);
+    node_free(&root);
+    if (e) return e;
+    t->root = rp;
+    e = save_metadata(t);
+    if (!e) e = bjfile_commit(&t->f);
+    return e;
+}
+
 bpt *bpt_create(const bj_io *io, int order) {
     if (order < 3) return NULL;
     bpt *t = (bpt *)calloc(1, sizeof(bpt));
@@ -1201,18 +1222,15 @@ bpt *bpt_create(const bj_io *io, int order) {
     bjfile_init(&t->f, io);
     t->order = order;
     t->min_keys = (order + 1) / 2 - 1;   /* ceil(order/2) - 1 */
-
-    if (bjfile_append_header(&t->f, t->bld, "bplustree")) { bpt_free(t); return NULL; }
-    bpt_node root;
-    if (node_build_leaf(&root, 0, NULL, NULL, 0, 0, 0)) { node_free(&root); bpt_free(t); return NULL; }
-    t->next_id = 1;
-    t->size = 0;
-    uint64_t rp;
-    if (save_node(t, &root, &rp)) { node_free(&root); bpt_free(t); return NULL; }
-    node_free(&root);
-    t->root = rp;
-    if (save_metadata(t) || bjfile_commit(&t->f)) { bpt_free(t); return NULL; }
+    if (init_empty(t)) { bpt_free(t); return NULL; }
     return t;
+}
+
+int bpt_reset(bpt *t) {
+    if (t->read_only) return BJ_ERR_STATE;
+    int e = bjfile_set_len(&t->f, 0);
+    if (e) return e;
+    return init_empty(t);
 }
 
 /* Commit-scan callback: a commit ends at each record that parses and

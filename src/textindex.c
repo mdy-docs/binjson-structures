@@ -739,42 +739,26 @@ int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journa
 
 /* ---- clear ---------------------------------------------------------- */
 
-/* Collect every key of `t` (as owned copies), then delete each. */
-static int clear_tree(bpt *t) {
-    const uint8_t *ap; size_t al;
-    int e = bpt_entries(t, &ap, &al);
-    if (e) return e;
-    dict keys; dict_init(&keys); /* value unused */
-    cur c = { ap, al, 0 };
-    uint32_t count;
-    if ((e = array_begin(&c, &count))) { dict_free(&keys); return e; }
-    for (uint32_t i = 0; i < count && !e; i++) {
-        uint32_t fields;
-        if ((e = object_begin(&c, &fields))) break;
-        for (uint32_t f = 0; f < fields && !e; f++) {
-            const uint8_t *kn; uint32_t klen;
-            if ((e = take_key(&c, &kn, &klen))) break;
-            if (name_eq(kn, klen, "key")) {
-                const uint8_t *sp; uint32_t sl;
-                if ((e = take_string(&c, &sp, &sl))) break;
-                e = dict_set(&keys, (const char *)sp, (int)sl, 0);
-            } else {
-                e = skip_value(&c);
-            }
-        }
-    }
-    for (int i = 0; i < keys.n && !e; i++) {
-        bpt_key k = str_key(keys.keys[i], keys.klen[i]);
-        e = bpt_delete(t, &k);
-    }
-    dict_free(&keys);
-    return e;
-}
-
+/*
+ * Clear by resetting each tree to a fresh empty file (bpt_reset) — O(1),
+ * where the old per-key deletion appended a rewritten path per key and
+ * could more than double the file it was clearing.
+ *
+ * Unlike add/remove, clear is destructive truncation and therefore not
+ * crash-atomic: the journal is emptied first (so recovery adopts whatever
+ * state the trees are in rather than refusing against stale lengths), and
+ * a crash mid-clear can leave some trees emptied and others not — re-run
+ * clear to finish. The final journal record restores normal atomicity for
+ * everything that follows.
+ */
 int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal) {
-    int e = clear_tree(index);
-    if (!e) e = clear_tree(doc_terms);
-    if (!e) e = clear_tree(doc_lengths);
+    if (journal && journal->truncate) {
+        int32_t te = journal->truncate(journal->ctx, 0);
+        if (te) return (int)te;
+    }
+    int e = bpt_reset(index);
+    if (!e) e = bpt_reset(doc_terms);
+    if (!e) e = bpt_reset(doc_lengths);
     if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
     return e;
 }
