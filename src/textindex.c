@@ -652,38 +652,53 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
     bj_builder *b = bj_builder_new();
     if (!b) { dict_free(&tf); return BJ_ERR_OOM; }
 
+    /*
+     * Re-adding an existing id replaces the document (a true diff): the doc
+     * is removed from the postings of terms that vanished from the new
+     * text, and documentTerms/documentLengths reflect only the new text.
+     * The JS reference instead merges new terms over old, leaving stale
+     * postings behind — a deliberate divergence (re-add must equal
+     * remove-then-add for a database index). Terms present in both
+     * versions are simply overwritten by post_add below.
+     */
+    {
+        bpt_key kd = str_key(doc_id, doc_id_len);
+        int found; const uint8_t *vp; size_t vl;
+        e = bpt_search(doc_terms, &kd, &found, &vp, &vl);
+        if (!e && found) {
+            dict old; dict_init(&old);
+            e = decode_obj(vp, vl, &old);
+            for (int i = 0; i < old.n && !e; i++) {
+                if (dict_find(&tf, old.keys[i], old.klen[i]) >= 0) continue;
+                e = post_remove(index, b, old.keys[i], old.klen[i], doc_id, doc_id_len);
+            }
+            dict_free(&old);
+        }
+    }
+
     /* Postings: merge each term's (docId, tf) into its active block. */
     for (int i = 0; i < tf.n && !e; i++)
         e = post_add(index, b, tf.keys[i], tf.klen[i], doc_id, doc_id_len, tf.vals[i]);
 
-    /* documentTerms: merge new terms over existing. */
+    /* documentTerms: exactly the new term map. */
     if (!e) {
         bpt_key kd = str_key(doc_id, doc_id_len);
-        int found; const uint8_t *vp; size_t vl;
-        e = bpt_search(doc_terms, &kd, &found, &vp, &vl);
-        dict merged; dict_init(&merged);
-        if (!e && found) e = decode_obj(vp, vl, &merged);
-        for (int i = 0; i < tf.n && !e; i++)
-            e = dict_set(&merged, tf.keys[i], tf.klen[i], tf.vals[i]);
         double doc_len = 0;
-        for (int i = 0; i < merged.n; i++) doc_len += merged.vals[i];
-        if (!e) {
-            const uint8_t *data; size_t dlen;
-            if (!(e = encode_obj(b, &merged, &data, &dlen)))
-                e = bpt_add(doc_terms, &kd, data, (uint32_t)dlen);
-        }
+        for (int i = 0; i < tf.n; i++) doc_len += tf.vals[i];
+        const uint8_t *data; size_t dlen;
+        if (!(e = encode_obj(b, &tf, &data, &dlen)))
+            e = bpt_add(doc_terms, &kd, data, (uint32_t)dlen);
         /* documentLengths: total term count as an int value. */
         if (!e) {
             bj_builder_reset(b);
             bj_put_int(b, (int64_t)doc_len);
             e = bj_builder_error(b);
             if (!e) {
-                size_t dlen; const uint8_t *data = bj_builder_data(b, &dlen);
-                if (!data) e = BJ_ERR_STATE;
-                else e = bpt_add(doc_lengths, &kd, data, (uint32_t)dlen);
+                size_t dlen2; const uint8_t *data2 = bj_builder_data(b, &dlen2);
+                if (!data2) e = BJ_ERR_STATE;
+                else e = bpt_add(doc_lengths, &kd, data2, (uint32_t)dlen2);
             }
         }
-        dict_free(&merged);
     }
 
     if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);

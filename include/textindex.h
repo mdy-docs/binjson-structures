@@ -48,7 +48,9 @@ extern "C" {
  */
 int tix_recover(const bj_io *journal, bpt *index, bpt *doc_terms, bpt *doc_lengths);
 
-/* Index `text` under `doc_id` (both UTF-8). Updates all three trees. */
+/* Index `text` under `doc_id` (both UTF-8). Updates all three trees.
+ * Re-adding an existing id replaces the document: postings of terms no
+ * longer in the text drop the doc (equivalent to remove-then-add). */
 int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
             const char *doc_id, int doc_id_len,
             const char *text, int text_len);
