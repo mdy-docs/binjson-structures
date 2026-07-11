@@ -191,28 +191,39 @@ static int read_number(cur *c, double *out) {
     }
     return BJ_ERR_UNKNOWN_TYPE;
 }
-static int read_pointer(cur *c, double *out) {
+static int read_pointer(cur *c, uint64_t *out) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;
     if (t != BJ_TYPE_POINTER) return BJ_ERR_UNKNOWN_TYPE;
     if (cur_need(c, 8)) return BJ_ERR_EOF;
-    *out = (double)rdu64(c->d + c->pos);
+    *out = rdu64(c->d + c->pos);
     c->pos += 8; return BJ_OK;
 }
 /* POINTER or NULL. Sets *has and, when present, *out. */
-static int read_ptr_or_null(cur *c, int *has, double *out) {
+static int read_ptr_or_null(cur *c, int *has, uint64_t *out) {
     if (cur_need(c, 1)) return BJ_ERR_EOF;
     if (c->d[c->pos] == BJ_TYPE_NULL) { c->pos++; *has = 0; return BJ_OK; }
     *has = 1;
     return read_pointer(c, out);
 }
-static int read_date(cur *c, double *out) {
+static int read_date(cur *c, int64_t *out) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;
     if (t != BJ_TYPE_DATE) return BJ_ERR_UNKNOWN_TYPE;
     if (cur_need(c, 8)) return BJ_ERR_EOF;
-    int64_t v = (int64_t)rdu64(c->d + c->pos);
-    c->pos += 8; *out = (double)v; return BJ_OK;
+    *out = (int64_t)rdu64(c->d + c->pos);
+    c->pos += 8; return BJ_OK;
+}
+/* Read a number that must be a non-negative integer (versions and counts
+ * travel as JS numbers on the wire but are integers by construction). */
+static int read_u64(cur *c, uint64_t *out) {
+    double d;
+    int e = read_number(c, &d);
+    if (e) return e;
+    if (!(d >= 0) || !(d <= 9007199254740991.0) ||
+        (double)(uint64_t)d != d) return BJ_ERR_STATE;
+    *out = (uint64_t)d;
+    return BJ_OK;
 }
 static int take_string(cur *c, const uint8_t **p, uint32_t *len) {
     uint8_t t;
@@ -252,14 +263,14 @@ typedef struct {
     int is_entry;                 /* has "type" key                    */
     int is_metadata;              /* has "diffsPerSnapshot" key        */
     int type;                     /* entry type (snapshot / diff)      */
-    double version;
+    uint64_t version;
     const uint8_t *hash; uint32_t hashlen;  /* into image              */
     const uint8_t *data; uint32_t datalen;  /* into image              */
-    double ts;
+    int64_t ts;
     /* metadata fields */
-    int has_snap; double snap;
-    int has_latest; double latest;
-    double diff_count;
+    int has_snap; uint64_t snap;
+    int has_latest; uint64_t latest;
+    int64_t diff_count;
     int diffs_per_snapshot;
 } trec;
 
@@ -279,7 +290,7 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
             if ((e = read_number(&c, &d))) return e;
             r->is_entry = 1; r->type = (int)d;
         } else if (name_eq(kn, klen, "version")) {
-            if ((e = read_number(&c, &r->version))) return e;
+            if ((e = read_u64(&c, &r->version))) return e;
         } else if (name_eq(kn, klen, "hash")) {
             if ((e = take_string(&c, &r->hash, &r->hashlen))) return e;
         } else if (name_eq(kn, klen, "data")) {
@@ -291,7 +302,9 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
         } else if (name_eq(kn, klen, "latestPointer")) {
             if ((e = read_ptr_or_null(&c, &r->has_latest, &r->latest))) return e;
         } else if (name_eq(kn, klen, "diffCount")) {
-            if ((e = read_number(&c, &r->diff_count))) return e;
+            uint64_t u;
+            if ((e = read_u64(&c, &u))) return e;
+            r->diff_count = (int64_t)u;
         } else if (name_eq(kn, klen, "diffsPerSnapshot")) {
             if ((e = read_number(&c, &d))) return e;
             r->is_metadata = 1; r->diffs_per_snapshot = (int)d;
@@ -309,7 +322,7 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
  * only the records a version actually needs. */
 typedef struct {
     uint64_t off;
-    double   version;
+    uint64_t version;
     uint8_t  type;               /* TL_FULL_SNAPSHOT / TL_DIFF          */
 } tl_ent;
 
@@ -317,11 +330,11 @@ struct textlog {
     bjfile      f;               /* backing file                        */
     dbuf        out;             /* last read output                    */
     bj_builder *bld;             /* reused for entry/metadata encoding  */
-    double      version;
-    double      diff_count;
+    uint64_t    version;
+    int64_t     diff_count;
     int         diffs_per_snapshot;
-    int         has_snapshot; double snapshot_ptr;
-    int         has_latest;   double latest_ptr;
+    int         has_snapshot; uint64_t snapshot_ptr;
+    int         has_latest;   uint64_t latest_ptr;
     tl_ent     *ents; int n_ents, cap_ents;   /* entry index            */
 };
 
@@ -351,7 +364,7 @@ static int append_builder(textlog *t) {
     return bjfile_append(&t->f, d, len, NULL);
 }
 
-static int encode_entry(textlog *t, int type, double version,
+static int encode_entry(textlog *t, int type, uint64_t version,
                         const uint8_t *hash, uint32_t hashlen,
                         const uint8_t *data, uint32_t datalen, int64_t ts_ms) {
     bj_builder *b = t->bld;
@@ -373,11 +386,11 @@ static int save_metadata(textlog *t) {
     bj_put_key(b, (const uint8_t *)"version", 7);
     bj_put_int(b, (int64_t)t->version);
     bj_put_key(b, (const uint8_t *)"snapshotPointer", 15);
-    if (t->has_snapshot) bj_put_pointer(b, (uint64_t)t->snapshot_ptr); else bj_put_null(b);
+    if (t->has_snapshot) bj_put_pointer(b, t->snapshot_ptr); else bj_put_null(b);
     bj_put_key(b, (const uint8_t *)"latestPointer", 13);
-    if (t->has_latest) bj_put_pointer(b, (uint64_t)t->latest_ptr); else bj_put_null(b);
+    if (t->has_latest) bj_put_pointer(b, t->latest_ptr); else bj_put_null(b);
     bj_put_key(b, (const uint8_t *)"diffCount", 9);
-    bj_put_int(b, (int64_t)t->diff_count);
+    bj_put_int(b, t->diff_count);
     bj_put_key(b, (const uint8_t *)"diffsPerSnapshot", 16);
     bj_put_int(b, t->diffs_per_snapshot);
     bj_end_object(b);
@@ -403,7 +416,7 @@ static int diff_err_to_bj(int e) {
  * patch in order, exactly like textlog.js getVersion. The entry index makes
  * this read only the snapshot + diff chain, not the whole file.
  */
-static int reconstruct_version(textlog *t, double version, dbuf *text) {
+static int reconstruct_version(textlog *t, uint64_t version, dbuf *text) {
     text->len = 0;
     int hi = t->n_ents - 1;
     while (hi >= 0 && t->ents[hi].version > version) hi--;
@@ -443,7 +456,7 @@ static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
     uint8_t hash[64];
     sha256_hex(text, text_len, hash);
 
-    double new_version = t->version + 1;
+    uint64_t new_version = t->version + 1;
     int should_snapshot = (t->diff_count >= t->diffs_per_snapshot) || !t->has_latest;
     int e;
 
@@ -452,7 +465,7 @@ static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
         if (e) return e;
         t->diff_count = 0;
         t->has_snapshot = 1;
-        t->snapshot_ptr = (double)offset;
+        t->snapshot_ptr = offset;
         *out_type = TL_FULL_SNAPSHOT;
     } else {
         dbuf prev; memset(&prev, 0, sizeof(prev));
@@ -470,17 +483,18 @@ static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
     }
 
     t->has_latest = 1;
-    t->latest_ptr = (double)offset;
+    t->latest_ptr = offset;
     t->version = new_version;
     return save_metadata(t);
 }
 
 int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
-                        int64_t ts_ms, double *out_version) {
+                        int64_t ts_ms, uint64_t *out_version) {
     /* Snapshot rollback state; commit the whole entry + metadata with one
      * host write, or leave the file (and this state) untouched on failure. */
-    double sv_version = t->version, sv_diff = t->diff_count;
-    double sv_sp = t->snapshot_ptr, sv_lp = t->latest_ptr;
+    uint64_t sv_version = t->version;
+    int64_t sv_diff = t->diff_count;
+    uint64_t sv_sp = t->snapshot_ptr, sv_lp = t->latest_ptr;
     int sv_hs = t->has_snapshot, sv_hl = t->has_latest;
 
     int e = ents_reserve(t, t->n_ents + 1);
@@ -504,7 +518,7 @@ int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
     return BJ_OK;
 }
 
-int textlog_get_version(textlog *t, double version,
+int textlog_get_version(textlog *t, uint64_t version,
                         const uint8_t **out_ptr, size_t *out_len) {
     dbuf text; memset(&text, 0, sizeof(text));
     int e = reconstruct_version(t, version, &text);
@@ -515,7 +529,7 @@ int textlog_get_version(textlog *t, double version,
     return BJ_OK;
 }
 
-int textlog_get_version_hash(textlog *t, double version,
+int textlog_get_version_hash(textlog *t, uint64_t version,
                              const uint8_t **out_ptr, size_t *out_len) {
     for (int i = t->n_ents - 1; i >= 0; i--) {
         if (t->ents[i].version != version) continue;
@@ -535,7 +549,7 @@ int textlog_get_version_hash(textlog *t, double version,
 
 /* ---- getDiff -------------------------------------------------------- */
 
-int textlog_get_diff(textlog *t, double from_version, double to_version,
+int textlog_get_diff(textlog *t, uint64_t from_version, uint64_t to_version,
                      const uint8_t **out_ptr, size_t *out_len) {
     dbuf from_text; memset(&from_text, 0, sizeof(from_text));
     dbuf to_text; memset(&to_text, 0, sizeof(to_text));
@@ -601,7 +615,7 @@ static int tl_scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
         tl_ent ent = { off, r.version, (uint8_t)r.type };
         s->t->ents[s->t->n_ents++] = ent;
     }
-    if (r.is_metadata && r.diffs_per_snapshot >= 1 && r.version >= 0) {
+    if (r.is_metadata && r.diffs_per_snapshot >= 1) {
         s->md[s->n_md & 1] = r;
         s->md_end[s->n_md & 1] = off + rec_len;
         s->n_md++;
@@ -638,9 +652,9 @@ textlog *textlog_open(const bj_io *io) {
     for (int i = 0; i < 2 && i < s.n_md; i++)
         if (s.md_end[i] == good) adopt = &s.md[i];
     if (!adopt ||
-        (adopt->has_snap && !(adopt->snap >= 0 && adopt->snap < (double)good)) ||
-        (adopt->has_latest && !(adopt->latest >= 0 && adopt->latest < (double)good)) ||
-        !(adopt->diff_count >= 0)) {
+        (adopt->has_snap && adopt->snap >= good) ||
+        (adopt->has_latest && adopt->latest >= good) ||
+        adopt->diff_count < 0) {
         textlog_free(t);
         return NULL;
     }
@@ -667,6 +681,6 @@ void textlog_free(textlog *t) {
     free(t);
 }
 
-double         textlog_version(const textlog *t)            { return t->version; }
+uint64_t       textlog_version(const textlog *t)            { return t->version; }
 int            textlog_diffs_per_snapshot(const textlog *t) { return t->diffs_per_snapshot; }
 const uint8_t *textlog_out(const textlog *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }

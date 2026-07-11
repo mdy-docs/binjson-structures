@@ -68,7 +68,7 @@ EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t, int dst_fd) {
     return rtree_compact(t, &dst);
 }
 
-EMSCRIPTEN_KEEPALIVE double rtw_size(rtree *t)        { return rtree_size(t); }
+EMSCRIPTEN_KEEPALIVE double rtw_size(rtree *t)        { return (double)rtree_size(t); }
 EMSCRIPTEN_KEEPALIVE int    rtw_max_entries(rtree *t) { return rtree_max_entries(t); }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *rtw_out_ptr(rtree *t) {

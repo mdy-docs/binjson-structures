@@ -34,26 +34,26 @@ EMSCRIPTEN_KEEPALIVE void tlw_free(textlog *t) { textlog_free(t); }
 /* Append a version. Returns the new version number, or a negative error code. */
 EMSCRIPTEN_KEEPALIVE double tlw_add_version(textlog *t, const uint8_t *text,
                                             int len, double ts_ms) {
-    double v = 0;
+    uint64_t v = 0;
     int e = textlog_add_version(t, text, (uint32_t)len, (int64_t)ts_ms, &v);
     if (e) return (double)e;
-    return v;
+    return (double)v;
 }
 
 EMSCRIPTEN_KEEPALIVE int tlw_get_version(textlog *t, double version) {
     const uint8_t *p; size_t n;
-    return textlog_get_version(t, version, &p, &n);
+    return textlog_get_version(t, (uint64_t)version, &p, &n);
 }
 EMSCRIPTEN_KEEPALIVE int tlw_get_version_hash(textlog *t, double version) {
     const uint8_t *p; size_t n;
-    return textlog_get_version_hash(t, version, &p, &n);
+    return textlog_get_version_hash(t, (uint64_t)version, &p, &n);
 }
 EMSCRIPTEN_KEEPALIVE int tlw_get_diff(textlog *t, double from_v, double to_v) {
     const uint8_t *p; size_t n;
-    return textlog_get_diff(t, from_v, to_v, &p, &n);
+    return textlog_get_diff(t, (uint64_t)from_v, (uint64_t)to_v, &p, &n);
 }
 
-EMSCRIPTEN_KEEPALIVE double tlw_version(textlog *t)            { return textlog_version(t); }
+EMSCRIPTEN_KEEPALIVE double tlw_version(textlog *t)            { return (double)textlog_version(t); }
 EMSCRIPTEN_KEEPALIVE int    tlw_diffs_per_snapshot(textlog *t) { return textlog_diffs_per_snapshot(t); }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_out_ptr(textlog *t) {

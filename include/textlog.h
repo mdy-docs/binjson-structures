@@ -51,7 +51,7 @@ textlog *textlog_open(const bj_io *io);
 void textlog_free(textlog *t);
 
 /* Accessors (mirror the JS metadata fields). */
-double         textlog_version(const textlog *t);
+uint64_t       textlog_version(const textlog *t);
 int            textlog_diffs_per_snapshot(const textlog *t);
 /* The last read output (getVersion / getVersionHash / getDiff); *len set. */
 const uint8_t *textlog_out(const textlog *t, size_t *len);
@@ -62,27 +62,27 @@ const uint8_t *textlog_out(const textlog *t, size_t *len);
  * computed here (SHA-256). Writes the new version number through *out_version.
  */
 int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
-                        int64_t ts_ms, double *out_version);
+                        int64_t ts_ms, uint64_t *out_version);
 
 /*
  * Reconstruct the full text of `version` into the output buffer, exposed via
  * out_ptr/out_len (valid until the next op). `version` must be in 1..current.
  */
-int textlog_get_version(textlog *t, double version,
+int textlog_get_version(textlog *t, uint64_t version,
                         const uint8_t **out_ptr, size_t *out_len);
 
 /*
  * Write the 64-char lowercase hex SHA-256 of `version` into the output buffer.
  * `version` must be in 1..current.
  */
-int textlog_get_version_hash(textlog *t, double version,
+int textlog_get_version_hash(textlog *t, uint64_t version,
                              const uint8_t **out_ptr, size_t *out_len);
 
 /*
  * Produce a human-readable unified diff between two versions into the output
  * buffer. Both versions must be in 1..current.
  */
-int textlog_get_diff(textlog *t, double from_version, double to_version,
+int textlog_get_diff(textlog *t, uint64_t from_version, uint64_t to_version,
                      const uint8_t **out_ptr, size_t *out_len);
 
 #ifdef __cplusplus

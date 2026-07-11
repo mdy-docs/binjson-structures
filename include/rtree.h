@@ -46,7 +46,7 @@ rtree *rtree_open(const bj_io *io);
 void rtree_free(rtree *t);
 
 /* Accessors (mirror the JS metadata fields). */
-double         rtree_size(const rtree *t);
+int64_t        rtree_size(const rtree *t);
 int            rtree_max_entries(const rtree *t);
 /* The last search output; writes its length through *len. */
 const uint8_t *rtree_out(const rtree *t, size_t *len);

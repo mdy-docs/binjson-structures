@@ -31,25 +31,25 @@
 typedef struct { uint8_t *bytes; uint32_t len; } bpt_blob;
 
 typedef struct {
-    double     id;
+    uint64_t   id;
     int        is_leaf;
     int        n_keys;
     bpt_key   *keys;        /* n_keys (string keys own their bytes)        */
     int        n_values;
     bpt_blob  *values;      /* n_values (== n_keys on leaves)              */
     int        n_children;
-    double    *children;    /* n_children (pointer offsets)                */
+    uint64_t  *children;    /* n_children (pointer offsets)                */
     int        has_next;
-    double     next;
+    uint64_t   next;
 } bpt_node;
 
 struct bpt {
     bjfile     f;                                     /* backing file      */
     uint8_t   *out; size_t out_len; size_t out_cap;   /* last op output    */
     bj_builder *bld;                                  /* reused for saves  */
-    double     root;
-    double     next_id;
-    double     size;
+    uint64_t   root;
+    uint64_t   next_id;
+    int64_t    size;
     int        order;
     int        min_keys;
 };
@@ -137,8 +137,8 @@ static void node_free(bpt_node *n) {
 }
 
 /* Build a leaf/internal node by deep-copying the supplied arrays. */
-static int node_build_leaf(bpt_node *out, double id, const bpt_key *keys,
-                           const bpt_blob *vals, int n, int has_next, double next) {
+static int node_build_leaf(bpt_node *out, uint64_t id, const bpt_key *keys,
+                           const bpt_blob *vals, int n, int has_next, uint64_t next) {
     node_init(out);
     out->id = id; out->is_leaf = 1; out->has_next = has_next; out->next = next;
     if (n) {
@@ -156,8 +156,8 @@ static int node_build_leaf(bpt_node *out, double id, const bpt_key *keys,
     return BJ_OK;
 }
 
-static int node_build_internal(bpt_node *out, double id, const bpt_key *keys,
-                               int nk, const double *children, int nc) {
+static int node_build_internal(bpt_node *out, uint64_t id, const bpt_key *keys,
+                               int nk, const uint64_t *children, int nc) {
     node_init(out);
     out->id = id; out->is_leaf = 0;
     if (nk) {
@@ -170,9 +170,9 @@ static int node_build_internal(bpt_node *out, double id, const bpt_key *keys,
     }
     out->n_keys = nk;
     if (nc) {
-        out->children = (double *)malloc((size_t)nc * sizeof(double));
+        out->children = (uint64_t *)malloc((size_t)nc * sizeof(uint64_t));
         if (!out->children) return BJ_ERR_OOM;
-        memcpy(out->children, children, (size_t)nc * sizeof(double));
+        memcpy(out->children, children, (size_t)nc * sizeof(uint64_t));
     }
     out->n_children = nc;
     return BJ_OK;
@@ -180,12 +180,8 @@ static int node_build_internal(bpt_node *out, double id, const bpt_key *keys,
 
 /* ---- File append & output buffer ------------------------------------ */
 
-static int file_append_to(bjfile *dst, const uint8_t *b, size_t n, double *off) {
-    uint64_t o;
-    int e = bjfile_append(dst, b, n, &o);
-    if (e) return e;
-    if (off) *off = (double)o;
-    return BJ_OK;
+static int file_append_to(bjfile *dst, const uint8_t *b, size_t n, uint64_t *off) {
+    return bjfile_append(dst, b, n, off);
 }
 static int set_out(bpt *t, const uint8_t *b, size_t n) {
     if (n > t->out_cap) {
@@ -242,13 +238,23 @@ static int read_bool(cur *c, int *out) {
     if (t == BJ_TYPE_FALSE) { *out = 0; return BJ_OK; }
     return BJ_ERR_UNKNOWN_TYPE;
 }
-static int read_pointer(cur *c, double *out) {
+static int read_pointer(cur *c, uint64_t *out) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;
     if (t != BJ_TYPE_POINTER) return BJ_ERR_UNKNOWN_TYPE;
     if (cur_need(c, 8)) return BJ_ERR_EOF;
-    *out = (double)rdu64(c->d + c->pos);
+    *out = rdu64(c->d + c->pos);
     c->pos += 8; return BJ_OK;
+}
+/* Read a number that must be a non-negative integer (ids and counts travel
+ * as JS numbers on the wire but are integers by construction). */
+static int read_u64(cur *c, uint64_t *out) {
+    double d;
+    int e = read_number(c, &d);
+    if (e) return e;
+    if (!is_safe_int(d) || d < 0) return BJ_ERR_STATE;
+    *out = (uint64_t)d;
+    return BJ_OK;
 }
 static int read_key(cur *c, bpt_key *out) {
     uint8_t t;
@@ -295,10 +301,10 @@ static int skip_value(cur *c) {
 /* ---- Node (de)serialization ----------------------------------------- */
 
 /* Decode the node object stored at `offset` in the file into `out`. */
-static int parse_node(bpt *t, double offset, bpt_node *out) {
+static int parse_node(bpt *t, uint64_t offset, bpt_node *out) {
     node_init(out);
     const uint8_t *rec; size_t rec_len;
-    int err = bjfile_read_record(&t->f, (uint64_t)offset, &rec, &rec_len);
+    int err = bjfile_read_record(&t->f, offset, &rec, &rec_len);
     if (err) return err;
     cur c = { rec, rec_len, 0 };
 
@@ -316,7 +322,7 @@ static int parse_node(bpt *t, double offset, bpt_node *out) {
         c.pos += klen;
         int e = BJ_OK;
         if (name_eq(kn, klen, "id")) {
-            e = read_number(&c, &out->id);
+            e = read_u64(&c, &out->id);
         } else if (name_eq(kn, klen, "isLeaf")) {
             e = read_bool(&c, &out->is_leaf);
         } else if (name_eq(kn, klen, "keys")) {
@@ -349,7 +355,7 @@ static int parse_node(bpt *t, double offset, bpt_node *out) {
             uint32_t n;
             if ((e = array_begin(&c, &n))) { node_free(out); return e; }
             if (n) {
-                out->children = (double *)malloc((size_t)n * sizeof(double));
+                out->children = (uint64_t *)malloc((size_t)n * sizeof(uint64_t));
                 if (!out->children) { node_free(out); return BJ_ERR_OOM; }
             }
             for (uint32_t j = 0; j < n; j++) {
@@ -363,7 +369,7 @@ static int parse_node(bpt *t, double offset, bpt_node *out) {
                 out->has_next = 0;
             } else if (nt == BJ_TYPE_POINTER) {
                 if (cur_need(&c, 8)) { node_free(out); return BJ_ERR_EOF; }
-                out->next = (double)rdu64(c.d + c.pos);
+                out->next = rdu64(c.d + c.pos);
                 c.pos += 8; out->has_next = 1;
             } else { node_free(out); return BJ_ERR_UNKNOWN_TYPE; }
         } else {
@@ -381,7 +387,7 @@ static int emit_key(bj_builder *b, const bpt_key *k) {
 }
 
 /* Encode `nd` and append it to `dst`; return its offset via *off. */
-static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, double *off) {
+static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, uint64_t *off) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
@@ -397,10 +403,10 @@ static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, double *off) 
     bj_end_array(b);
     bj_put_key(b, (const uint8_t *)"children", 8);
     bj_begin_array(b);
-    for (int i = 0; i < nd->n_children; i++) bj_put_pointer(b, (uint64_t)nd->children[i]);
+    for (int i = 0; i < nd->n_children; i++) bj_put_pointer(b, nd->children[i]);
     bj_end_array(b);
     bj_put_key(b, (const uint8_t *)"next", 4);
-    if (nd->has_next) bj_put_pointer(b, (uint64_t)nd->next);
+    if (nd->has_next) bj_put_pointer(b, nd->next);
     else bj_put_null(b);
     bj_end_object(b);
 
@@ -413,22 +419,22 @@ static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, double *off) 
 }
 
 /* Append `nd` to the tree's live file. */
-static int save_node(bpt *t, const bpt_node *nd, double *off) {
+static int save_node(bpt *t, const bpt_node *nd, uint64_t *off) {
     return encode_node_to(t, nd, &t->f, off);
 }
 
 /* ---- Metadata ------------------------------------------------------- */
 
-static int encode_metadata_to(bpt *t, bjfile *dst, double root,
-                              double next_id, double size) {
+static int encode_metadata_to(bpt *t, bjfile *dst, uint64_t root,
+                              uint64_t next_id, int64_t size) {
     bj_builder *b = t->bld;
     bj_builder_reset(b);
     bj_begin_object(b);
     bj_put_key(b, (const uint8_t *)"version", 7);      bj_put_int(b, 1);
     bj_put_key(b, (const uint8_t *)"maxEntries", 10);  bj_put_int(b, t->order);
     bj_put_key(b, (const uint8_t *)"minEntries", 10);  bj_put_int(b, t->min_keys);
-    bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, (int64_t)size);
-    bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, (uint64_t)root);
+    bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, size);
+    bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, root);
     bj_put_key(b, (const uint8_t *)"nextId", 6);       bj_put_int(b, (int64_t)next_id);
     bj_end_object(b);
 
@@ -447,9 +453,10 @@ static int save_metadata(bpt *t) {
 }
 
 typedef struct {
-    double root, next_id, size;
-    int    order, min_keys;
-    int    have_root;
+    uint64_t root, next_id;
+    int64_t  size;
+    int      order, min_keys;
+    int      have_root;
 } bpt_meta;
 
 /* Parse a metadata record's fields out of its bytes. */
@@ -470,10 +477,11 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, bpt_meta *m) {
         c.pos += klen;
         int e = BJ_OK;
         double d;
+        uint64_t u;
         if (name_eq(kn, klen, "maxEntries"))      { if ((e = read_number(&c, &d))) return e; m->order = (int)d; }
         else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; m->min_keys = (int)d; }
-        else if (name_eq(kn, klen, "size"))       { if ((e = read_number(&c, &m->size))) return e; }
-        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_number(&c, &m->next_id))) return e; }
+        else if (name_eq(kn, klen, "size"))       { if ((e = read_u64(&c, &u))) return e; m->size = (int64_t)u; }
+        else if (name_eq(kn, klen, "nextId"))     { if ((e = read_u64(&c, &m->next_id))) return e; }
         else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
         else                                      { if ((e = skip_value(&c))) return e; }
     }
@@ -485,9 +493,8 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, bpt_meta *m) {
 static int meta_valid(const bpt_meta *m, uint64_t before) {
     if (m->order < 3) return 0;
     if (m->min_keys < 1 || m->min_keys >= m->order) return 0;
-    if (!(m->size >= 0)) return 0;
-    if (!(m->next_id >= 0)) return 0;
-    if (!(m->root >= 0) || m->root >= (double)before) return 0;
+    if (m->size < 0) return 0;
+    if (m->root >= before) return 0;
     return 1;
 }
 
@@ -509,7 +516,7 @@ typedef struct {
     bpt_key  split_key;   /* when is_split                               */
 } add_res;
 
-static int add_node(bpt *t, double ptr, const bpt_key *key,
+static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
                     const uint8_t *val, uint32_t vlen, add_res *out) {
     memset(out, 0, sizeof(*out));
     bpt_node nd;
@@ -570,13 +577,13 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
     if (e) { node_free(&nd); return e; }
 
     if (!cr.is_split) {
-        double ncp;
+        uint64_t ncp;
         e = save_node(t, &cr.newn, &ncp);
         node_free(&cr.newn);
         if (e) { node_free(&nd); return e; }
-        double *wc = (double *)malloc((size_t)nd.n_children * sizeof(double));
+        uint64_t *wc = (uint64_t *)malloc((size_t)nd.n_children * sizeof(uint64_t));
         if (!wc) { node_free(&nd); return BJ_ERR_OOM; }
-        memcpy(wc, nd.children, (size_t)nd.n_children * sizeof(double));
+        memcpy(wc, nd.children, (size_t)nd.n_children * sizeof(uint64_t));
         wc[childIdx] = ncp;
         e = node_build_internal(&out->newn, nd.id, nd.keys, nd.n_keys, wc, nd.n_children);
         free(wc);
@@ -587,7 +594,7 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
     }
 
     /* Child split: save both halves, splice splitKey + the two child pointers. */
-    double lp, rp;
+    uint64_t lp, rp;
     e = save_node(t, &cr.left, &lp);
     if (!e) e = save_node(t, &cr.right, &rp);
     node_free(&cr.left); node_free(&cr.right);
@@ -595,8 +602,8 @@ static int add_node(bpt *t, double ptr, const bpt_key *key,
 
     int nkeys = nd.n_keys + 1;
     int nch = nd.n_children + 1;
-    bpt_key *wk = (bpt_key *)malloc((size_t)nkeys * sizeof(bpt_key));
-    double  *wc = (double *)malloc((size_t)nch * sizeof(double));
+    bpt_key  *wk = (bpt_key *)malloc((size_t)nkeys * sizeof(bpt_key));
+    uint64_t *wc = (uint64_t *)malloc((size_t)nch * sizeof(uint64_t));
     if (!wk || !wc) { free(wk); free(wc); key_free(&cr.split_key); node_free(&nd); return BJ_ERR_OOM; }
     for (int i = 0; i < childIdx; i++) wk[i] = nd.keys[i];
     wk[childIdx] = cr.split_key;
@@ -630,18 +637,18 @@ static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vle
     if (!res.is_split) {
         new_root = res.newn;   /* take ownership */
     } else {
-        double lp, rp;
+        uint64_t lp, rp;
         e = save_node(t, &res.left, &lp);
         if (!e) e = save_node(t, &res.right, &rp);
         node_free(&res.left); node_free(&res.right);
         if (e) { key_free(&res.split_key); return e; }
-        double children[2] = { lp, rp };
+        uint64_t children[2] = { lp, rp };
         e = node_build_internal(&new_root, t->next_id++, &res.split_key, 1, children, 2);
         key_free(&res.split_key);
         if (e) { node_free(&new_root); return e; }
     }
 
-    double rootp;
+    uint64_t rootp;
     e = save_node(t, &new_root, &rootp);
     node_free(&new_root);
     if (e) return e;
@@ -657,7 +664,8 @@ static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vle
  * the in-memory state is rolled back, leaving the file untouched.
  */
 int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
-    double root = t->root, next_id = t->next_id, size = t->size;
+    uint64_t root = t->root, next_id = t->next_id;
+    int64_t size = t->size;
     int e = add_root(t, key, val, vlen);
     if (!e) e = bjfile_commit(&t->f);
     if (e) {
@@ -671,7 +679,7 @@ int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
 
 typedef struct { int found; bpt_node node; } del_res;
 
-static int del_node(bpt *t, double ptr, const bpt_key *key, del_res *out) {
+static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out) {
     memset(out, 0, sizeof(*out));
     bpt_node nd;
     int e = parse_node(t, ptr, &nd);
@@ -705,13 +713,13 @@ static int del_node(bpt *t, double ptr, const bpt_key *key, del_res *out) {
     if (e) { node_free(&nd); return e; }
     if (!cr.found) { out->found = 0; node_free(&nd); return BJ_OK; }
 
-    double ncp;
+    uint64_t ncp;
     e = save_node(t, &cr.node, &ncp);
     node_free(&cr.node);
     if (e) { node_free(&nd); return e; }
-    double *wc = (double *)malloc((size_t)nd.n_children * sizeof(double));
+    uint64_t *wc = (uint64_t *)malloc((size_t)nd.n_children * sizeof(uint64_t));
     if (!wc) { node_free(&nd); return BJ_ERR_OOM; }
-    memcpy(wc, nd.children, (size_t)nd.n_children * sizeof(double));
+    memcpy(wc, nd.children, (size_t)nd.n_children * sizeof(uint64_t));
     wc[i] = ncp;
     e = node_build_internal(&out->node, nd.id, nd.keys, nd.n_keys, wc, nd.n_children);
     free(wc);
@@ -729,13 +737,13 @@ static int delete_root(bpt *t, const bpt_key *key) {
     bpt_node final_root = res.node;   /* take ownership */
     /* Collapse a now-empty internal root down to its only child. */
     if (final_root.n_keys == 0 && !final_root.is_leaf && final_root.n_children > 0) {
-        double child = final_root.children[0];
+        uint64_t child = final_root.children[0];
         node_free(&final_root);
         e = parse_node(t, child, &final_root);
         if (e) return e;
     }
 
-    double rootp;
+    uint64_t rootp;
     e = save_node(t, &final_root, &rootp);
     node_free(&final_root);
     if (e) return e;
@@ -745,7 +753,8 @@ static int delete_root(bpt *t, const bpt_key *key) {
 }
 
 int bpt_delete(bpt *t, const bpt_key *key) {
-    double root = t->root, next_id = t->next_id, size = t->size;
+    uint64_t root = t->root, next_id = t->next_id;
+    int64_t size = t->size;
     int e = delete_root(t, key);
     if (!e) e = bjfile_commit(&t->f);
     if (e) {
@@ -759,7 +768,7 @@ int bpt_delete(bpt *t, const bpt_key *key) {
 
 int bpt_search(bpt *t, const bpt_key *key, int *found,
                const uint8_t **out_ptr, size_t *out_len) {
-    double ptr = t->root;
+    uint64_t ptr = t->root;
     for (;;) {
         bpt_node nd;
         int e = parse_node(t, ptr, &nd);
@@ -780,7 +789,7 @@ int bpt_search(bpt *t, const bpt_key *key, int *found,
         }
         int i = 0;
         while (i < nd.n_keys && key_cmp(key, &nd.keys[i]) >= 0) i++;
-        double child = nd.children[i];
+        uint64_t child = nd.children[i];
         node_free(&nd);
         ptr = child;
     }
@@ -793,7 +802,7 @@ int bpt_search(bpt *t, const bpt_key *key, int *found,
  * can overlap the range are visited — a range scan reads O(height) nodes
  * plus the leaves that actually hold matches, not the whole tree.
  */
-static int collect(bpt *t, double ptr, bj_builder *b, int filt,
+static int collect(bpt *t, uint64_t ptr, bj_builder *b, int filt,
                    const bpt_key *mn, const bpt_key *mx, int depth) {
     if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
     bpt_node nd;
@@ -878,7 +887,7 @@ struct bpt_cursor {
  * cursor's lower bound (same equal-keys-route-right rule as bpt_search) and
  * positions the leaf at the first key >= min; otherwise it goes leftmost.
  */
-static int cursor_descend(bpt_cursor *c, double ptr, int seek_min) {
+static int cursor_descend(bpt_cursor *c, uint64_t ptr, int seek_min) {
     for (;;) {
         if (c->depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
         bpt_node nd;
@@ -901,7 +910,7 @@ static int cursor_descend(bpt_cursor *c, double ptr, int seek_min) {
             while (lo < nd.n_keys && key_cmp(&c->min, &nd.keys[lo]) >= 0) lo++;
             if (lo >= nd.n_children) lo = nd.n_children - 1;
         }
-        double child = nd.children[lo];
+        uint64_t child = nd.children[lo];
         c->stack[c->depth].node = nd;   /* take ownership */
         c->stack[c->depth].idx = lo + 1;
         c->depth++;
@@ -952,7 +961,7 @@ int bpt_cursor_next(bpt_cursor *c, bpt_key *key,
         while (c->depth > 0) {
             cur_frame *f = &c->stack[c->depth - 1];
             if (f->idx < f->node.n_children) {
-                double ptr = f->node.children[f->idx++];
+                uint64_t ptr = f->node.children[f->idx++];
                 int e = cursor_descend(c, ptr, 0);
                 if (e) { c->done = 1; cursor_release(c); return e; }
                 advanced = 1;
@@ -1012,14 +1021,14 @@ void bpt_cursor_close(bpt_cursor *c) {
 
 int bpt_height(bpt *t, int *out_height) {
     int h = 0;
-    double ptr = t->root;
+    uint64_t ptr = t->root;
     for (;;) {
         bpt_node nd;
         int e = parse_node(t, ptr, &nd);
         if (e) return e;
         if (nd.is_leaf) { node_free(&nd); break; }
         h++;
-        double child = nd.children[0];
+        uint64_t child = nd.children[0];
         node_free(&nd);
         ptr = child;
     }
@@ -1046,7 +1055,7 @@ int bpt_height(bpt *t, int *out_height) {
 typedef struct {
     bpt_key  *keys;     int n_keys;       /* up to order-1                  */
     bpt_blob *vals;     int n_vals;       /* level 0 only                   */
-    double   *children; int n_children;   /* levels > 0, up to order        */
+    uint64_t *children; int n_children;   /* levels > 0, up to order        */
     bpt_key   node_sep; int has_sep;      /* separator preceding this node  */
     int       emitted;                    /* nodes already written at level */
 } bl_level;
@@ -1056,8 +1065,8 @@ typedef struct {
     bjfile   *dst;
     bl_level *levels;
     int       n_levels, cap_levels;
-    double    next_id;
-    double    fed;                        /* entries streamed in            */
+    uint64_t  next_id;
+    int64_t   fed;                        /* entries streamed in            */
 } bulk_loader;
 
 static int bl_ensure_level(bulk_loader *bl, int L) {
@@ -1080,7 +1089,7 @@ static int bl_ensure_level(bulk_loader *bl, int L) {
             lev->vals = (bpt_blob *)calloc((size_t)order, sizeof(bpt_blob));
             if (!lev->vals) return BJ_ERR_OOM;
         } else {
-            lev->children = (double *)calloc((size_t)order, sizeof(double));
+            lev->children = (uint64_t *)calloc((size_t)order, sizeof(uint64_t));
             if (!lev->children) return BJ_ERR_OOM;
         }
         bl->n_levels++;
@@ -1090,7 +1099,7 @@ static int bl_ensure_level(bulk_loader *bl, int L) {
 
 /* Write level L's in-progress node to the destination; contents are consumed
  * (freed) but the arrays are kept for reuse. */
-static int bl_write_node(bulk_loader *bl, int L, double *ptr) {
+static int bl_write_node(bulk_loader *bl, int L, uint64_t *ptr) {
     bl_level *lev = &bl->levels[L];
     bpt_node nd;
     node_init(&nd);
@@ -1113,7 +1122,7 @@ static int bl_write_node(bulk_loader *bl, int L, double *ptr) {
  * When the level's node is full it is written out first, its own preceding
  * separator promoted upward with it, and the new node starts with `ptr`.
  */
-static int bl_add_child(bulk_loader *bl, int L, int has_sep, bpt_key *sep, double ptr) {
+static int bl_add_child(bulk_loader *bl, int L, int has_sep, bpt_key *sep, uint64_t ptr) {
     int e = bl_ensure_level(bl, L);
     if (e) { if (has_sep) key_free(sep); return e; }
     bl_level *lev = &bl->levels[L];
@@ -1126,7 +1135,7 @@ static int bl_add_child(bulk_loader *bl, int L, int has_sep, bpt_key *sep, doubl
         return BJ_OK;
     }
     if (lev->n_children == bl->t->order) {
-        double p;
+        uint64_t p;
         e = bl_write_node(bl, L, &p);
         if (e) { if (has_sep) key_free(sep); return e; }
         int up_has = lev->has_sep;
@@ -1151,7 +1160,7 @@ static int bl_add_entry(bulk_loader *bl, bpt_key *key, bpt_blob *val) {
     bl_level *lev = &bl->levels[0];
 
     if (lev->n_keys == bl->t->order - 1) {
-        double p;
+        uint64_t p;
         e = bl_write_node(bl, 0, &p);
         if (e) return e;
         int up_has = lev->has_sep;
@@ -1171,7 +1180,7 @@ static int bl_add_entry(bulk_loader *bl, bpt_key *key, bpt_blob *val) {
 
 /* Flush remaining partial nodes bottom-up; the sole node at the highest
  * populated level becomes the root. */
-static int bl_finish(bulk_loader *bl, double *root) {
+static int bl_finish(bulk_loader *bl, uint64_t *root) {
     int e = bl_ensure_level(bl, 0);   /* empty tree: emit an empty leaf */
     if (e) return e;
     for (int L = 0; ; L++) {
@@ -1179,7 +1188,7 @@ static int bl_finish(bulk_loader *bl, double *root) {
         if (lev->emitted == 0 && L == bl->n_levels - 1) {
             return bl_write_node(bl, L, root);
         }
-        double p;
+        uint64_t p;
         e = bl_write_node(bl, L, &p);
         if (e) return e;
         int up_has = lev->has_sep;
@@ -1205,7 +1214,7 @@ static void bl_dispose(bulk_loader *bl) {
 
 /* In-order walk of the source tree, streaming leaf entries into the loader.
  * Ownership of each entry's key/value moves into the loader. */
-static int compact_walk(bpt *t, double ptr, bulk_loader *bl, int depth) {
+static int compact_walk(bpt *t, uint64_t ptr, bulk_loader *bl, int depth) {
     if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
     bpt_node nd;
     int e = parse_node(t, ptr, &nd);
@@ -1238,7 +1247,7 @@ int bpt_compact(bpt *t, const bj_io *dst_io) {
 
     int e = bjfile_append_header(&dst, t->bld, "bplustree");
     if (!e) e = compact_walk(t, t->root, &bl, 0);
-    double root = 0;
+    uint64_t root = 0;
     if (!e) e = bl_finish(&bl, &root);
     if (!e) e = encode_metadata_to(t, &dst, root, bl.next_id, bl.fed);
     if (!e) e = bjfile_commit(&dst);
@@ -1264,7 +1273,7 @@ bpt *bpt_create(const bj_io *io, int order) {
     if (node_build_leaf(&root, 0, NULL, NULL, 0, 0, 0)) { node_free(&root); bpt_free(t); return NULL; }
     t->next_id = 1;
     t->size = 0;
-    double rp;
+    uint64_t rp;
     if (save_node(t, &root, &rp)) { node_free(&root); bpt_free(t); return NULL; }
     node_free(&root);
     t->root = rp;
@@ -1338,7 +1347,7 @@ void bpt_free(bpt *t) {
     free(t);
 }
 
-double         bpt_size(const bpt *t)     { return t->size; }
-double         bpt_root(const bpt *t)     { return t->root; }
-double         bpt_next_id(const bpt *t)  { return t->next_id; }
+int64_t        bpt_size(const bpt *t)     { return t->size; }
+uint64_t       bpt_root(const bpt *t)     { return t->root; }
+uint64_t       bpt_next_id(const bpt *t)  { return t->next_id; }
 int            bpt_order(const bpt *t)    { return t->order; }

@@ -47,10 +47,11 @@ bpt *bpt_open(const bj_io *io);
 /* Free a tree and all its buffers (does not touch the file). Safe on NULL. */
 void bpt_free(bpt *t);
 
-/* Accessors (mirror the JS metadata fields). */
-double         bpt_size(const bpt *t);
-double         bpt_root(const bpt *t);
-double         bpt_next_id(const bpt *t);
+/* Accessors (mirror the JS metadata fields; the WASM glue converts to the
+ * doubles JS expects). */
+int64_t        bpt_size(const bpt *t);
+uint64_t       bpt_root(const bpt *t);
+uint64_t       bpt_next_id(const bpt *t);
 int            bpt_order(const bpt *t);
 
 /* Insert/update. `val`/`val_len` is one pre-encoded binjson value (opaque). */

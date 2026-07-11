@@ -128,9 +128,9 @@ EMSCRIPTEN_KEEPALIVE void bptw_cursor_free(bpt_cursor *cur) {
     bpt_cursor_close(cur);
 }
 
-EMSCRIPTEN_KEEPALIVE double bptw_size(bpt *t)    { return bpt_size(t); }
-EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return bpt_root(t); }
-EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return bpt_next_id(t); }
+EMSCRIPTEN_KEEPALIVE double bptw_size(bpt *t)    { return (double)bpt_size(t); }
+EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return (double)bpt_root(t); }
+EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return (double)bpt_next_id(t); }
 EMSCRIPTEN_KEEPALIVE int    bptw_order(bpt *t)   { return bpt_order(t); }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_out_ptr(void) { return g_out_ptr; }
