@@ -12,6 +12,8 @@
  */
 #include "bplustree.h"
 #include "bjfile.h"
+#include "bjcursor.h"
+#include "dbuf.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +47,7 @@ typedef struct {
 
 struct bpt {
     bjfile     f;                                     /* backing file      */
-    uint8_t   *out; size_t out_len; size_t out_cap;   /* last op output    */
+    dbuf       out;                                   /* last op output    */
     bj_builder *bld;                                  /* reused for saves  */
     uint64_t   root;
     uint64_t   next_id;
@@ -54,25 +56,7 @@ struct bpt {
     int        min_keys;
 };
 
-/* ---- Little-endian readers ------------------------------------------ */
-
-static uint32_t rdu32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rdu64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
-
 /* ---- Key helpers ---------------------------------------------------- */
-
-static int is_safe_int(double d) {
-    if (!isfinite(d)) return 0;
-    if (d < BJ_MIN_SAFE_INT || d > BJ_MAX_SAFE_INT) return 0;
-    return d == floor(d);
-}
 
 /* Mirrors JS comparison for numbers (numeric) and strings (lexicographic by
  * bytes). Differing types get a stable order (number < string); trees never mix
@@ -184,78 +168,12 @@ static int file_append_to(bjfile *dst, const uint8_t *b, size_t n, uint64_t *off
     return bjfile_append(dst, b, n, off);
 }
 static int set_out(bpt *t, const uint8_t *b, size_t n) {
-    if (n > t->out_cap) {
-        uint8_t *nb = (uint8_t *)realloc(t->out, n ? n : 1);
-        if (!nb) return BJ_ERR_OOM;
-        t->out = nb; t->out_cap = n;
-    }
-    if (n) memcpy(t->out, b, n);
-    t->out_len = n;
-    return BJ_OK;
+    t->out.len = 0;
+    return dbuf_put(&t->out, b, n);
 }
 
-/* ---- Wire-format cursor readers ------------------------------------- */
+/* ---- Wire-format readers (structure-specific; primitives in bjcursor.h) */
 
-typedef struct { const uint8_t *d; size_t len; size_t pos; } cur;
-
-static int cur_need(const cur *c, size_t n) { return n <= c->len - c->pos ? BJ_OK : BJ_ERR_EOF; }
-static int take_type(cur *c, uint8_t *t) {
-    if (cur_need(c, 1)) return BJ_ERR_EOF;
-    *t = c->d[c->pos++];
-    return BJ_OK;
-}
-static int take_u32(cur *c, uint32_t *v) {
-    if (cur_need(c, 4)) return BJ_ERR_EOF;
-    *v = rdu32(c->d + c->pos);
-    c->pos += 4;
-    return BJ_OK;
-}
-
-static int name_eq(const uint8_t *p, uint32_t len, const char *s) {
-    size_t sl = strlen(s);
-    return len == sl && memcmp(p, s, sl) == 0;
-}
-
-static int read_number(cur *c, double *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t == BJ_TYPE_INT) {
-        if (cur_need(c, 8)) return BJ_ERR_EOF;
-        int64_t v = (int64_t)rdu64(c->d + c->pos);
-        c->pos += 8; *out = (double)v; return BJ_OK;
-    }
-    if (t == BJ_TYPE_FLOAT) {
-        if (cur_need(c, 8)) return BJ_ERR_EOF;
-        uint64_t bits = rdu64(c->d + c->pos);
-        c->pos += 8; memcpy(out, &bits, 8); return BJ_OK;
-    }
-    return BJ_ERR_UNKNOWN_TYPE;
-}
-static int read_bool(cur *c, int *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t == BJ_TYPE_TRUE)  { *out = 1; return BJ_OK; }
-    if (t == BJ_TYPE_FALSE) { *out = 0; return BJ_OK; }
-    return BJ_ERR_UNKNOWN_TYPE;
-}
-static int read_pointer(cur *c, uint64_t *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t != BJ_TYPE_POINTER) return BJ_ERR_UNKNOWN_TYPE;
-    if (cur_need(c, 8)) return BJ_ERR_EOF;
-    *out = rdu64(c->d + c->pos);
-    c->pos += 8; return BJ_OK;
-}
-/* Read a number that must be a non-negative integer (ids and counts travel
- * as JS numbers on the wire but are integers by construction). */
-static int read_u64(cur *c, uint64_t *out) {
-    double d;
-    int e = read_number(c, &d);
-    if (e) return e;
-    if (!is_safe_int(d) || d < 0) return BJ_ERR_STATE;
-    *out = (uint64_t)d;
-    return BJ_OK;
-}
 static int read_key(cur *c, bpt_key *out) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;
@@ -281,21 +199,6 @@ static int read_key(cur *c, bpt_key *out) {
         return BJ_OK;
     }
     return BJ_ERR_UNKNOWN_TYPE;
-}
-static int array_begin(cur *c, uint32_t *count) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t != BJ_TYPE_ARRAY) return BJ_ERR_UNKNOWN_TYPE;
-    uint32_t size;
-    if (take_u32(c, &size)) return BJ_ERR_EOF;
-    return take_u32(c, count);
-}
-static int skip_value(cur *c) {
-    size_t sz;
-    int e = bj_value_size(c->d, c->len, c->pos, &sz);
-    if (e) return e;
-    if (cur_need(c, sz)) return BJ_ERR_EOF;
-    c->pos += sz; return BJ_OK;
 }
 
 /* ---- Node (de)serialization ----------------------------------------- */
@@ -780,7 +683,7 @@ int bpt_search(bpt *t, const bpt_key *key, int *found,
                 e = set_out(t, nd.values[fi].bytes, nd.values[fi].len);
                 node_free(&nd);
                 if (e) return e;
-                *found = 1; *out_ptr = t->out; *out_len = t->out_len;
+                *found = 1; *out_ptr = t->out.data; *out_len = t->out.len;
                 return BJ_OK;
             }
             node_free(&nd);
@@ -848,7 +751,7 @@ static int collect_to_out(bpt *t, int filt, const bpt_key *mn, const bpt_key *mx
         size_t len;
         const uint8_t *d = bj_builder_data(b, &len);
         if (!d) e = BJ_ERR_STATE;
-        else if (!(e = set_out(t, d, len))) { *out_ptr = t->out; *out_len = t->out_len; }
+        else if (!(e = set_out(t, d, len))) { *out_ptr = t->out.data; *out_len = t->out.len; }
     }
     bj_builder_free(b);
     return e;
@@ -1006,8 +909,8 @@ int bpt_cursor_next_batch(bpt_cursor *c, size_t max_bytes, int *count,
     e = set_out(t, d, len);
     if (e) return e;
     *count = n;
-    *out_ptr = t->out;
-    *out_len = t->out_len;
+    *out_ptr = t->out.data;
+    *out_len = t->out.len;
     return BJ_OK;
 }
 
@@ -1343,7 +1246,7 @@ void bpt_free(bpt *t) {
     if (!t) return;
     bj_builder_free(t->bld);
     bjfile_dispose(&t->f);
-    free(t->out);
+    dbuf_free(&t->out);
     free(t);
 }
 

@@ -12,6 +12,8 @@
  */
 #include "rtree.h"
 #include "bjfile.h"
+#include "bjcursor.h"
+#include "dbuf.h"
 #include "geo.h"
 
 #include <stdlib.h>
@@ -78,27 +80,6 @@ typedef struct {
  * and fall back to loading children; they are upgraded whenever rewritten.
  */
 
-/* ---- Dynamic byte buffer -------------------------------------------- */
-
-typedef struct { uint8_t *data; size_t len, cap; } dbuf;
-
-static int dbuf_ensure(dbuf *b, size_t extra) {
-    if (b->len + extra <= b->cap) return BJ_OK;
-    size_t nc = b->cap ? b->cap : 256;
-    while (nc < b->len + extra) nc *= 2;
-    uint8_t *nb = (uint8_t *)realloc(b->data, nc);
-    if (!nb) return BJ_ERR_OOM;
-    b->data = nb; b->cap = nc;
-    return BJ_OK;
-}
-static int dbuf_append(dbuf *b, const uint8_t *p, size_t n) {
-    int e = dbuf_ensure(b, n);
-    if (e) return e;
-    memcpy(b->data + b->len, p, n);
-    b->len += n;
-    return BJ_OK;
-}
-
 struct rtree {
     bjfile      f;           /* backing file                   */
     dbuf        out;         /* last op output                 */
@@ -112,117 +93,10 @@ struct rtree {
 
 static int set_out(rtree *t, const uint8_t *b, size_t n) {
     t->out.len = 0;
-    return dbuf_append(&t->out, b, n);
+    return dbuf_put(&t->out, b, n);
 }
 
-/* ---- Little-endian readers ------------------------------------------ */
-
-static uint32_t rdu32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rdu64(const uint8_t *p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
-
-static int is_safe_int(double d) {
-    if (!isfinite(d)) return 0;
-    if (d < BJ_MIN_SAFE_INT || d > BJ_MAX_SAFE_INT) return 0;
-    return d == floor(d);
-}
-
-/* ---- Wire-format cursor readers ------------------------------------- */
-
-typedef struct { const uint8_t *d; size_t len; size_t pos; } cur;
-
-static int cur_need(const cur *c, size_t n) { return n <= c->len - c->pos ? BJ_OK : BJ_ERR_EOF; }
-static int take_type(cur *c, uint8_t *t) {
-    if (cur_need(c, 1)) return BJ_ERR_EOF;
-    *t = c->d[c->pos++];
-    return BJ_OK;
-}
-static int take_u32(cur *c, uint32_t *v) {
-    if (cur_need(c, 4)) return BJ_ERR_EOF;
-    *v = rdu32(c->d + c->pos);
-    c->pos += 4;
-    return BJ_OK;
-}
-static int name_eq(const uint8_t *p, uint32_t len, const char *s) {
-    size_t sl = strlen(s);
-    return len == sl && memcmp(p, s, sl) == 0;
-}
-static int read_number(cur *c, double *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t == BJ_TYPE_INT) {
-        if (cur_need(c, 8)) return BJ_ERR_EOF;
-        int64_t v = (int64_t)rdu64(c->d + c->pos);
-        c->pos += 8; *out = (double)v; return BJ_OK;
-    }
-    if (t == BJ_TYPE_FLOAT) {
-        if (cur_need(c, 8)) return BJ_ERR_EOF;
-        uint64_t bits = rdu64(c->d + c->pos);
-        c->pos += 8; memcpy(out, &bits, 8); return BJ_OK;
-    }
-    return BJ_ERR_UNKNOWN_TYPE;
-}
-static int read_bool(cur *c, int *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t == BJ_TYPE_TRUE)  { *out = 1; return BJ_OK; }
-    if (t == BJ_TYPE_FALSE) { *out = 0; return BJ_OK; }
-    return BJ_ERR_UNKNOWN_TYPE;
-}
-static int read_pointer(cur *c, uint64_t *out) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t != BJ_TYPE_POINTER) return BJ_ERR_UNKNOWN_TYPE;
-    if (cur_need(c, 8)) return BJ_ERR_EOF;
-    *out = rdu64(c->d + c->pos);
-    c->pos += 8; return BJ_OK;
-}
-/* Read a number that must be a non-negative integer (ids and counts travel
- * as JS numbers on the wire but are integers by construction). */
-static int read_u64(cur *c, uint64_t *out) {
-    double d;
-    int e = read_number(c, &d);
-    if (e) return e;
-    if (!is_safe_int(d) || d < 0) return BJ_ERR_STATE;
-    *out = (uint64_t)d;
-    return BJ_OK;
-}
-static int object_begin(cur *c, uint32_t *count) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t != BJ_TYPE_OBJECT) return BJ_ERR_UNKNOWN_TYPE;
-    uint32_t size;
-    if (take_u32(c, &size)) return BJ_ERR_EOF;
-    return take_u32(c, count);
-}
-static int array_begin(cur *c, uint32_t *count) {
-    uint8_t t;
-    if (take_type(c, &t)) return BJ_ERR_EOF;
-    if (t != BJ_TYPE_ARRAY) return BJ_ERR_UNKNOWN_TYPE;
-    uint32_t size;
-    if (take_u32(c, &size)) return BJ_ERR_EOF;
-    return take_u32(c, count);
-}
-static int take_key(cur *c, const uint8_t **kn, uint32_t *klen) {
-    if (take_u32(c, klen)) return BJ_ERR_EOF;
-    if (cur_need(c, *klen)) return BJ_ERR_EOF;
-    *kn = c->d + c->pos;
-    c->pos += *klen;
-    return BJ_OK;
-}
-static int skip_value(cur *c) {
-    size_t sz;
-    int e = bj_value_size(c->d, c->len, c->pos, &sz);
-    if (e) return e;
-    if (cur_need(c, sz)) return BJ_ERR_EOF;
-    c->pos += sz; return BJ_OK;
-}
+/* ---- Wire-format readers (structure-specific; primitives in bjcursor.h) */
 
 /* Read a bbox: either NULL or an object { minLat, maxLat, minLng, maxLng }. */
 static int read_bbox(cur *c, rbbox *out) {
