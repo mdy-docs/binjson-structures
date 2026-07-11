@@ -605,6 +605,119 @@ int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
 
 typedef struct { int found; bpt_node node; } del_res;
 
+/*
+ * Child `i` of `par` fell below min_keys after a delete. Restore the
+ * invariant against an adjacent sibling: concatenate the pair (internal
+ * nodes pull the parent separator down between them) and, when the result
+ * exceeds node capacity, split it back in two at the same midpoint insert
+ * splits use. One path covers both classic cases — a rich sibling
+ * redistributes (concatenate + split), a poor one merges outright — and
+ * absorbs arbitrarily underfull nodes in files written before rebalancing
+ * existed. `ch` is the child's new, not-yet-saved node; the parent's
+ * replacement (also unsaved) is built into `out`.
+ */
+static int rebalance_child(bpt *t, const bpt_node *par, int i,
+                           const bpt_node *ch, bpt_node *out) {
+    int si = i > 0 ? i - 1 : i + 1;   /* adjacent sibling */
+    int li = si < i ? si : i;         /* left node of the pair */
+    bpt_node sib;
+    int e = parse_node(t, par->children[si], &sib);
+    if (e) return e;
+    if (sib.is_leaf != ch->is_leaf) { node_free(&sib); return BJ_ERR_STATE; }
+    const bpt_node *L = si < i ? &sib : ch;
+    const bpt_node *R = si < i ? ch : &sib;
+
+    /* Concatenated pair, as shallow scratch arrays (node_build_* deep-copies). */
+    int leaf = ch->is_leaf;
+    int nk = L->n_keys + R->n_keys + (leaf ? 0 : 1);
+    int nc = L->n_children + R->n_children;
+    bpt_key  *wk = (bpt_key *)malloc((size_t)(nk ? nk : 1) * sizeof(bpt_key));
+    bpt_blob *wv = leaf ? (bpt_blob *)malloc((size_t)(nk ? nk : 1) * sizeof(bpt_blob)) : NULL;
+    uint64_t *wc = leaf ? NULL : (uint64_t *)malloc((size_t)nc * sizeof(uint64_t));
+    if (!wk || (leaf ? !wv : !wc)) {
+        free(wk); free(wv); free(wc); node_free(&sib);
+        return BJ_ERR_OOM;
+    }
+    int k = 0;
+    for (int j = 0; j < L->n_keys; j++) wk[k++] = L->keys[j];
+    if (!leaf) wk[k++] = par->keys[li];
+    for (int j = 0; j < R->n_keys; j++) wk[k++] = R->keys[j];
+    if (leaf) {
+        for (int j = 0; j < L->n_keys; j++) wv[j] = L->values[j];
+        for (int j = 0; j < R->n_keys; j++) wv[L->n_keys + j] = R->values[j];
+    } else {
+        memcpy(wc, L->children, (size_t)L->n_children * sizeof(uint64_t));
+        memcpy(wc + L->n_children, R->children, (size_t)R->n_children * sizeof(uint64_t));
+    }
+
+    int split = nk >= t->order;
+    uint64_t lp = 0, rp = 0;
+    bpt_key promoted = {0};       /* owned separator copy when split */
+    bpt_node nn;
+    if (!split) {
+        if (leaf) e = node_build_leaf(&nn, L->id, wk, wv, nk, R->has_next, R->next);
+        else      e = node_build_internal(&nn, L->id, wk, nk, wc, nc);
+        if (!e) e = save_node(t, &nn, &lp);
+        node_free(&nn);
+    } else if (leaf) {
+        int mid = (nk + 1) / 2;   /* ceil(nk/2), as in insert */
+        e = node_build_leaf(&nn, L->id, wk, wv, mid, 0, 0);
+        if (!e) e = save_node(t, &nn, &lp);
+        node_free(&nn);
+        if (!e) {
+            e = node_build_leaf(&nn, R->id, wk + mid, wv + mid, nk - mid,
+                                R->has_next, R->next);
+            if (!e) e = save_node(t, &nn, &rp);
+            node_free(&nn);
+        }
+        if (!e) e = key_copy(&promoted, &wk[mid]);
+    } else {
+        int mid = (nk + 1) / 2 - 1;   /* ceil(nk/2) - 1, as in insert */
+        e = node_build_internal(&nn, L->id, wk, mid, wc, mid + 1);
+        if (!e) e = save_node(t, &nn, &lp);
+        node_free(&nn);
+        if (!e) {
+            e = node_build_internal(&nn, R->id, wk + mid + 1, nk - mid - 1,
+                                    wc + mid + 1, nc - (mid + 1));
+            if (!e) e = save_node(t, &nn, &rp);
+            node_free(&nn);
+        }
+        if (!e) e = key_copy(&promoted, &wk[mid]);
+    }
+    free(wk); free(wv); free(wc);
+    node_free(&sib);
+    if (e) return e;
+
+    /* Rebuild the parent: a merge drops separator li and one child; a split
+     * replaces separator li and points at the two new halves. */
+    int pnk = split ? par->n_keys : par->n_keys - 1;
+    int pnc = split ? par->n_children : par->n_children - 1;
+    bpt_key  *pk = (bpt_key *)malloc((size_t)(pnk ? pnk : 1) * sizeof(bpt_key));
+    uint64_t *pc = (uint64_t *)malloc((size_t)pnc * sizeof(uint64_t));
+    if (!pk || !pc) {
+        free(pk); free(pc);
+        if (split) key_free(&promoted);
+        return BJ_ERR_OOM;
+    }
+    if (split) {
+        for (int j = 0; j < par->n_keys; j++) pk[j] = par->keys[j];
+        pk[li] = promoted;
+        memcpy(pc, par->children, (size_t)par->n_children * sizeof(uint64_t));
+        pc[li] = lp;
+        pc[li + 1] = rp;
+    } else {
+        int m = 0;
+        for (int j = 0; j < par->n_keys; j++) if (j != li) pk[m++] = par->keys[j];
+        m = 0;
+        for (int j = 0; j < par->n_children; j++) if (j != li + 1) pc[m++] = par->children[j];
+        pc[li] = lp;
+    }
+    e = node_build_internal(out, par->id, pk, pnk, pc, pnc);
+    free(pk); free(pc);
+    if (split) key_free(&promoted);
+    return e;
+}
+
 static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out,
                     int depth) {
     memset(out, 0, sizeof(*out));
@@ -641,6 +754,17 @@ static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out,
     if (e) { node_free(&nd); return e; }
     if (!cr.found) { out->found = 0; node_free(&nd); return BJ_OK; }
 
+    if (cr.node.n_keys < t->min_keys && nd.n_children >= 2) {
+        /* Underflow: restore min_keys against a sibling instead of leaving
+         * an ever-sparser node referenced forever. */
+        e = rebalance_child(t, &nd, i, &cr.node, &out->node);
+        node_free(&cr.node);
+        node_free(&nd);
+        if (e) return e;
+        out->found = 1;
+        return BJ_OK;
+    }
+
     uint64_t ncp;
     e = save_node(t, &cr.node, &ncp);
     node_free(&cr.node);
@@ -663,8 +787,12 @@ static int delete_root(bpt *t, const bpt_key *key) {
     if (!res.found) return BJ_OK;   /* key not present: no-op */
 
     bpt_node final_root = res.node;   /* take ownership */
-    /* Collapse a now-empty internal root down to its only child. */
-    if (final_root.n_keys == 0 && !final_root.is_leaf && final_root.n_children > 0) {
+    /* Collapse empty internal roots down to their only child — merging the
+     * root's last two children leaves it with one. Bounded like every other
+     * walk over file-provided pointers. */
+    for (int d = 0; final_root.n_keys == 0 && !final_root.is_leaf &&
+                    final_root.n_children > 0; d++) {
+        if (d > BPT_MAX_DEPTH) { node_free(&final_root); return BJ_ERR_DEPTH; }
         uint64_t child = final_root.children[0];
         node_free(&final_root);
         e = parse_node(t, child, &final_root);
