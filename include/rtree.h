@@ -51,6 +51,40 @@ int            rtree_max_entries(const rtree *t);
 /* The last search output; writes its length through *len. */
 const uint8_t *rtree_out(const rtree *t, size_t *len);
 
+/* ---- Spatial cursor ---------------------------------------------------- */
+
+/*
+ * Streams bounding-box matches with bounded memory (a descent stack plus
+ * one leaf) instead of materializing the result set. The root is pinned at
+ * open: the tree being append-only, a cursor iterates a consistent snapshot
+ * across concurrent mutations. Close every cursor before rtree_free.
+ */
+typedef struct rtree_cursor rtree_cursor;
+
+/* Open a cursor over entries inside the box. NaN bounds are rejected
+ * (returns NULL, as for OOM or an unreadable root). */
+rtree_cursor *rtree_cursor_open(rtree *t, double min_lat, double max_lat,
+                                double min_lng, double max_lng);
+/* Advance: 1 = entry written to lat/lng/oid12, 0 = end, negative = error. */
+int rtree_cursor_next(rtree_cursor *c, double *lat, double *lng, uint8_t oid12[12]);
+/*
+ * Pull entries in bulk as a binjson ARRAY of { objectId, lat, lng } (the
+ * searchBBox result shape) until ~max_bytes accumulate or the cursor ends.
+ * *count = 0 signals the end; bytes valid until the next op on the tree.
+ */
+int rtree_cursor_next_batch(rtree_cursor *c, size_t max_bytes, int *count,
+                            const uint8_t **out_ptr, size_t *out_len);
+void rtree_cursor_close(rtree_cursor *c);
+
+/*
+ * The k nearest entries to a point, best-first over node bounding boxes:
+ * reads only the subtrees whose boxes can beat the current candidates,
+ * instead of scanning. Result: binjson ARRAY of { objectId, lat, lng,
+ * distance } sorted by ascending haversine distance (km), at most k long.
+ */
+int rtree_nearest(rtree *t, double lat, double lng, int k,
+                  const uint8_t **out_ptr, size_t *out_len);
+
 /* Insert a point (lat, lng) with a 12-byte ObjectId. */
 int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12);
 /* Remove the first entry matching `oid12`. Writes 1/0 to *removed. */

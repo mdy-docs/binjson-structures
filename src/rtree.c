@@ -1088,6 +1088,278 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
     return e;
 }
 
+/* ---- Spatial cursor --------------------------------------------------- */
+
+/*
+ * Streams bbox matches with bounded memory: a descent stack plus one leaf
+ * (O(height) state), reading one node at a time instead of materializing
+ * the result set. The root is pinned at open, so — the tree being
+ * append-only — a cursor iterates a consistent snapshot across concurrent
+ * inserts/removes. childBBoxes prune subtrees without parsing them.
+ */
+typedef struct { rnode node; int idx; } rt_frame;
+
+struct rtree_cursor {
+    rtree   *t;
+    rbbox    q;
+    rt_frame stack[RT_MAX_DEPTH + 1];
+    int      depth;
+    rnode    leaf;
+    int      has_leaf, leaf_pos;
+    int      done;
+};
+
+/* Parse `ptr` onto the cursor: leaves become the active leaf, internal
+ * nodes a stack frame; nodes outside the query are dropped silently. */
+static int rtc_visit(rtree_cursor *c, uint64_t ptr) {
+    if (c->depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
+    rnode nd;
+    int e = parse_node(c->t, ptr, &nd);
+    if (e) return e;
+    if (!nd.bbox.valid || !bbox_intersects(&c->q, &nd.bbox)) {
+        node_free(&nd);
+        return BJ_OK;
+    }
+    if (nd.is_leaf) {
+        c->leaf = nd;   /* take ownership */
+        c->has_leaf = 1;
+        c->leaf_pos = 0;
+        return BJ_OK;
+    }
+    c->stack[c->depth].node = nd;   /* take ownership */
+    c->stack[c->depth].idx = 0;
+    c->depth++;
+    return BJ_OK;
+}
+
+static void rtc_release(rtree_cursor *c) {
+    if (c->has_leaf) { node_free(&c->leaf); c->has_leaf = 0; }
+    while (c->depth > 0) node_free(&c->stack[--c->depth].node);
+}
+
+rtree_cursor *rtree_cursor_open(rtree *t, double min_lat, double max_lat,
+                                double min_lng, double max_lng) {
+    if (isnan(min_lat) || isnan(max_lat) || isnan(min_lng) || isnan(max_lng))
+        return NULL;
+    rtree_cursor *c = (rtree_cursor *)calloc(1, sizeof(rtree_cursor));
+    if (!c) return NULL;
+    c->t = t;
+    c->q.valid = 1;
+    c->q.min_lat = min_lat; c->q.max_lat = max_lat;
+    c->q.min_lng = min_lng; c->q.max_lng = max_lng;
+    if (rtc_visit(c, t->root)) { rtree_cursor_close(c); return NULL; }
+    if (!c->has_leaf && c->depth == 0) c->done = 1;   /* root outside query */
+    return c;
+}
+
+int rtree_cursor_next(rtree_cursor *c, double *lat, double *lng, uint8_t oid12[12]) {
+    if (c->done) return 0;
+    for (;;) {
+        if (c->has_leaf) {
+            while (c->leaf_pos < c->leaf.n) {
+                rentry *en = &c->leaf.entries[c->leaf_pos++];
+                if (!bbox_intersects(&c->q, &en->bbox)) continue;
+                *lat = en->lat;
+                *lng = en->lng;
+                memcpy(oid12, en->oid, 12);
+                return 1;
+            }
+            node_free(&c->leaf);
+            c->has_leaf = 0;
+        }
+        int advanced = 0;
+        while (c->depth > 0 && !advanced) {
+            rt_frame *f = &c->stack[c->depth - 1];
+            if (f->idx < f->node.n) {
+                int i = f->idx++;
+                if (f->node.has_cb &&
+                    (!f->node.child_bboxes[i].valid ||
+                     !bbox_intersects(&c->q, &f->node.child_bboxes[i])))
+                    continue;
+                int before = c->depth;
+                int e = rtc_visit(c, f->node.children[i]);
+                if (e) { rtc_release(c); c->done = 1; return e; }
+                if (c->has_leaf || c->depth > before) advanced = 1;
+            } else {
+                node_free(&f->node);
+                c->depth--;
+            }
+        }
+        if (!advanced) { c->done = 1; return 0; }
+    }
+}
+
+int rtree_cursor_next_batch(rtree_cursor *c, size_t max_bytes, int *count,
+                            const uint8_t **out_ptr, size_t *out_len) {
+    rtree *t = c->t;
+    bj_builder *b = t->bld;
+    bj_builder_reset(b);
+    bj_begin_array(b);
+    int n = 0;
+    size_t approx = 0;
+    while (approx < max_bytes) {
+        double la, ln;
+        uint8_t oid[12];
+        int r = rtree_cursor_next(c, &la, &ln, oid);
+        if (r < 0) return r;
+        if (r == 0) break;
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"objectId", 8); bj_put_oid(b, oid);
+        bj_put_key(b, (const uint8_t *)"lat", 3);      emit_number(b, la);
+        bj_put_key(b, (const uint8_t *)"lng", 3);      emit_number(b, ln);
+        bj_end_object(b);
+        n++;
+        approx += 60;
+    }
+    bj_end_array(b);
+    int e = bj_builder_error(b);
+    if (e) return e;
+    size_t len;
+    const uint8_t *d = bj_builder_data(b, &len);
+    if (!d) return BJ_ERR_STATE;
+    if ((e = set_out(t, d, len))) return e;
+    *count = n;
+    *out_ptr = t->out.data;
+    *out_len = t->out.len;
+    return BJ_OK;
+}
+
+void rtree_cursor_close(rtree_cursor *c) {
+    if (!c) return;
+    rtc_release(c);
+    free(c);
+}
+
+/* ---- k-nearest neighbors (best-first) --------------------------------- */
+
+typedef struct {
+    double   dist;
+    int      is_entry;
+    uint64_t ptr;      /* node offset when !is_entry */
+    rentry   ent;      /* when is_entry              */
+} knn_item;
+
+typedef struct { knn_item *a; int n, cap; } knn_heap;
+
+static int heap_push(knn_heap *h, knn_item it) {
+    if (h->n == h->cap) {
+        int nc = h->cap ? h->cap * 2 : 64;
+        knn_item *na = (knn_item *)realloc(h->a, (size_t)nc * sizeof(knn_item));
+        if (!na) return BJ_ERR_OOM;
+        h->a = na;
+        h->cap = nc;
+    }
+    int i = h->n++;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (h->a[p].dist <= it.dist) break;
+        h->a[i] = h->a[p];
+        i = p;
+    }
+    h->a[i] = it;
+    return BJ_OK;
+}
+
+static knn_item heap_pop(knn_heap *h) {
+    knn_item top = h->a[0];
+    knn_item last = h->a[--h->n];
+    int i = 0;
+    for (;;) {
+        int l = 2 * i + 1, r = l + 1, m = i;
+        if (l < h->n && h->a[l].dist < last.dist) m = l;
+        if (r < h->n && h->a[r].dist < (m == i ? last.dist : h->a[l].dist)) m = r;
+        if (m == i) break;
+        h->a[i] = h->a[m];
+        i = m;
+    }
+    h->a[i] = last;
+    return top;
+}
+
+/* Minimum haversine distance from a point to a lat/lng box: clamp the point
+ * into the box, then measure. (Shares the existing geo simplifications: no
+ * antimeridian wrap handling.) */
+static double mindist_to_box(double lat, double lng, const rbbox *b) {
+    double clat = lat < b->min_lat ? b->min_lat : (lat > b->max_lat ? b->max_lat : lat);
+    double clng = lng < b->min_lng ? b->min_lng : (lng > b->max_lng ? b->max_lng : lng);
+    return geo_haversine_distance(lat, lng, clat, clng);
+}
+
+int rtree_nearest(rtree *t, double lat, double lng, int k,
+                  const uint8_t **out_ptr, size_t *out_len) {
+    if (isnan(lat) || isnan(lng) || k < 0) return BJ_ERR_STATE;
+    knn_heap h;
+    memset(&h, 0, sizeof(h));
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_array(b);
+
+    /* Nodes are >= a few dozen bytes; a hostile pointer cycle would revisit
+     * offsets forever, so cap node visits by what the file could hold. */
+    uint64_t budget = bjfile_len(&t->f) / 8 + 64;
+
+    int e = BJ_OK, emitted = 0;
+    knn_item root_it;
+    memset(&root_it, 0, sizeof(root_it));
+    root_it.ptr = t->root;
+    if (k > 0) e = heap_push(&h, root_it);
+
+    while (!e && h.n > 0 && emitted < k) {
+        knn_item it = heap_pop(&h);
+        if (it.is_entry) {
+            bj_begin_object(b);
+            bj_put_key(b, (const uint8_t *)"objectId", 8); bj_put_oid(b, it.ent.oid);
+            bj_put_key(b, (const uint8_t *)"lat", 3);      emit_number(b, it.ent.lat);
+            bj_put_key(b, (const uint8_t *)"lng", 3);      emit_number(b, it.ent.lng);
+            bj_put_key(b, (const uint8_t *)"distance", 8); emit_number(b, it.dist);
+            bj_end_object(b);
+            if ((e = bj_builder_error(b))) break;
+            emitted++;
+            continue;
+        }
+        if (budget-- == 0) { e = BJ_ERR_STATE; break; }
+        rnode nd;
+        if ((e = parse_node(t, it.ptr, &nd))) break;
+        if (nd.is_leaf) {
+            for (int i = 0; i < nd.n && !e; i++) {
+                knn_item en;
+                memset(&en, 0, sizeof(en));
+                en.is_entry = 1;
+                en.ent = nd.entries[i];
+                en.dist = geo_haversine_distance(lat, lng, nd.entries[i].lat, nd.entries[i].lng);
+                e = heap_push(&h, en);
+            }
+        } else {
+            for (int i = 0; i < nd.n && !e; i++) {
+                rbbox cb;
+                if ((e = child_bbox(t, &nd, i, &cb))) break;
+                if (!cb.valid) continue;
+                knn_item ch;
+                memset(&ch, 0, sizeof(ch));
+                ch.ptr = nd.children[i];
+                ch.dist = mindist_to_box(lat, lng, &cb);
+                e = heap_push(&h, ch);
+            }
+        }
+        node_free(&nd);
+    }
+
+    bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len;
+        const uint8_t *d = bj_builder_data(b, &len);
+        if (!d) e = BJ_ERR_STATE;
+        else if (!(e = set_out(t, d, len))) {
+            *out_ptr = t->out.data;
+            *out_len = t->out.len;
+        }
+    }
+    free(h.a);
+    bj_builder_free(b);
+    return e;
+}
+
 /* ---- Compaction ----------------------------------------------------- */
 
 /* Open-addressing old-offset -> new-offset map (offsets are exact u64s). */

@@ -79,6 +79,30 @@ EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t, int dst_fd) {
 EMSCRIPTEN_KEEPALIVE double rtw_size(rtree *t)        { return (double)rtree_size(t); }
 EMSCRIPTEN_KEEPALIVE int    rtw_max_entries(rtree *t) { return rtree_max_entries(t); }
 
+EMSCRIPTEN_KEEPALIVE rtree_cursor *rtw_cursor_open(rtree *t, double min_lat,
+                                                   double max_lat, double min_lng,
+                                                   double max_lng) {
+    return rtree_cursor_open(t, min_lat, max_lat, min_lng, max_lng);
+}
+
+/* Fills the tree's output buffer; returns the entry count (0 = end). */
+EMSCRIPTEN_KEEPALIVE int rtw_cursor_next(rtree_cursor *c, int max_bytes) {
+    int count = 0;
+    const uint8_t *p; size_t n;
+    int e = rtree_cursor_next_batch(c, (size_t)max_bytes, &count, &p, &n);
+    if (e) return e;
+    return count;
+}
+
+EMSCRIPTEN_KEEPALIVE void rtw_cursor_free(rtree_cursor *c) {
+    rtree_cursor_close(c);
+}
+
+EMSCRIPTEN_KEEPALIVE int rtw_nearest(rtree *t, double lat, double lng, int k) {
+    const uint8_t *p; size_t n;
+    return rtree_nearest(t, lat, lng, k, &p, &n);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *rtw_out_ptr(rtree *t) {
     size_t n; return rtree_out(t, &n);
 }
