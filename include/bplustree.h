@@ -77,6 +77,17 @@ int bpt_range(bpt *t, const bpt_key *min, const bpt_key *max,
 /* Tree height (0 for a single leaf). */
 int bpt_height(bpt *t, int *out_height);
 
+/* Current length of the backing file (committed + pending bytes). */
+uint64_t bpt_file_len(const bpt *t);
+/*
+ * Truncate the backing file to `len` — which must be a commit boundary
+ * (the bytes at len-135 must be a valid metadata record) — and reload the
+ * tree's state from it. Because the file is append-only, this atomically
+ * rewinds the tree to the state it had when that commit landed. Used for
+ * cross-file transaction rollback (textindex journal).
+ */
+int bpt_rewind(bpt *t, uint64_t len);
+
 /*
  * Rewrite the live entries (dropping append-only history and deletion cruft)
  * into the destination file `dst`, which is expected to be empty, as a

@@ -35,6 +35,10 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *p, size_t n) {
     return ~crc;
 }
 
+uint32_t bjfile_crc32(uint32_t crc, const uint8_t *p, size_t n) {
+    return crc32_update(crc, p, n);
+}
+
 /* ---- Little-endian scalar helpers ------------------------------------ */
 
 static uint32_t rd32(const uint8_t *p) {

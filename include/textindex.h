@@ -35,17 +35,30 @@
 extern "C" {
 #endif
 
+/*
+ * Cross-tree atomicity: one add/remove/clear spans many tree commits over
+ * three append-only files, so a crash in between leaves the index
+ * inconsistent. When a `journal` io is supplied to the mutating operations,
+ * the three file lengths are recorded in it (one tiny fixed-offset write)
+ * after all tree writes land, and tix_recover — call it right after opening
+ * the trees — rewinds each tree to the newest recorded consistent triple,
+ * making every operation atomic across the three files. NULL disables
+ * journaling (legacy behavior). A journal belongs to one set of tree files:
+ * after compacting into fresh files, start them with an empty journal.
+ */
+int tix_recover(const bj_io *journal, bpt *index, bpt *doc_terms, bpt *doc_lengths);
+
 /* Index `text` under `doc_id` (both UTF-8). Updates all three trees. */
-int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths,
+int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
             const char *doc_id, int doc_id_len,
             const char *text, int text_len);
 
 /* Remove `doc_id` from the index. Writes 1/0 through *removed. */
-int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths,
+int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
                const char *doc_id, int doc_id_len, int *removed);
 
 /* Delete every entry from all three trees. */
-int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths);
+int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal);
 
 /* Relevance query: ARRAY of { id, score } sorted by descending score. */
 int tix_query(bpt *index, bpt *doc_terms, bpt *doc_lengths,

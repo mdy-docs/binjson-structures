@@ -8,6 +8,7 @@
  */
 #include "textindex.h"
 #include "bjcursor.h"
+#include "bjfile.h"
 #include "stemmer.h"
 
 #include <stdlib.h>
@@ -525,9 +526,123 @@ static int post_remove(bpt *index, bj_builder *b, const char *term, int tlen,
     return e;
 }
 
+/* ---- Cross-tree commit journal (crash atomicity) ---------------------- */
+
+/*
+ * One tix_add / tix_remove / tix_clear spans many individual tree commits
+ * across three append-only files; a crash in between leaves the index
+ * internally inconsistent (postings without a document length, half-updated
+ * terms). The journal makes the operations atomic: after all tree writes
+ * land, the three file lengths are recorded, and tix_recover rewinds each
+ * tree to the newest recorded triple — rewinding an append-only file to a
+ * commit boundary restores exactly the state at that commit, so a partially
+ * applied operation disappears whole.
+ *
+ * Layout: two fixed 48-byte slots written alternately (ping-pong), so a
+ * torn slot write can only damage the slot being replaced while the other
+ * still holds the previous transaction. An empty journal imposes no
+ * constraint (pre-journal or freshly compacted files are adopted as-is).
+ */
+#define TIXJ_SLOT 48
+
+static void wr32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void wr64le(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
+}
+
+static void tixj_encode(uint8_t s[TIXJ_SLOT], uint64_t txn, const uint64_t lens[3]) {
+    memset(s, 0, TIXJ_SLOT);
+    memcpy(s, "TIXJ", 4);
+    wr32le(s + 4, 1);   /* version */
+    wr64le(s + 8, txn);
+    wr64le(s + 16, lens[0]);
+    wr64le(s + 24, lens[1]);
+    wr64le(s + 32, lens[2]);
+    wr32le(s + 40, bjfile_crc32(0, s, 40));
+}
+static int tixj_decode(const uint8_t *s, uint64_t *txn, uint64_t lens[3]) {
+    if (memcmp(s, "TIXJ", 4) != 0) return 0;
+    if (rdu32(s + 4) != 1) return 0;
+    if (rdu32(s + 40) != bjfile_crc32(0, s, 40)) return 0;
+    *txn = rdu64(s + 8);
+    lens[0] = rdu64(s + 16);
+    lens[1] = rdu64(s + 24);
+    lens[2] = rdu64(s + 32);
+    return 1;
+}
+
+/* Read the valid slots, newest first. Returns 0..2 or a negative error. */
+static int tixj_read(const bj_io *j, uint64_t txn[2], uint64_t lens[2][3]) {
+    uint8_t buf[2 * TIXJ_SLOT];
+    memset(buf, 0, sizeof(buf));
+    uint64_t sz = j->size(j->ctx);
+    if (sz > 0) {
+        uint32_t want = sz < sizeof(buf) ? (uint32_t)sz : (uint32_t)sizeof(buf);
+        int64_t got = j->read(j->ctx, 0, buf, want);
+        if (got < 0) return (int)got;
+    }
+    uint64_t t0, l0[3], t1, l1[3];
+    int v0 = tixj_decode(buf, &t0, l0);
+    int v1 = tixj_decode(buf + TIXJ_SLOT, &t1, l1);
+    if (v0 && v1) {
+        int newer0 = t0 >= t1;
+        txn[0] = newer0 ? t0 : t1;
+        memcpy(lens[0], newer0 ? l0 : l1, sizeof(l0));
+        txn[1] = newer0 ? t1 : t0;
+        memcpy(lens[1], newer0 ? l1 : l0, sizeof(l0));
+        return 2;
+    }
+    if (v0 || v1) {
+        txn[0] = v0 ? t0 : t1;
+        memcpy(lens[0], v0 ? l0 : l1, sizeof(l0));
+        return 1;
+    }
+    return 0;
+}
+
+/* Record the current tree lengths as one committed transaction. */
+static int tixj_commit(const bj_io *j, bpt *index, bpt *doc_terms, bpt *doc_lengths) {
+    uint64_t txn[2], lens[2][3];
+    int n = tixj_read(j, txn, lens);
+    if (n < 0) return n;
+    uint64_t next = n ? txn[0] + 1 : 1;
+    uint64_t cur[3] = {
+        bpt_file_len(index), bpt_file_len(doc_terms), bpt_file_len(doc_lengths)
+    };
+    uint8_t s[TIXJ_SLOT];
+    tixj_encode(s, next, cur);
+    /* txn 1 lands in slot 0 (empty file: no write gap), then alternate. */
+    int32_t w = j->write(j->ctx, (next & 1) ? 0 : TIXJ_SLOT, s, TIXJ_SLOT);
+    return w ? (int)w : BJ_OK;
+}
+
+int tix_recover(const bj_io *journal, bpt *index, bpt *doc_terms, bpt *doc_lengths) {
+    if (!journal) return BJ_OK;
+    uint64_t txn[2], lens[2][3];
+    int n = tixj_read(journal, txn, lens);
+    if (n < 0) return n;
+    if (n == 0) return BJ_OK;   /* fresh or reset journal: adopt files as-is */
+    bpt *trees[3] = { index, doc_terms, doc_lengths };
+    for (int c = 0; c < n; c++) {
+        int ok = 1;
+        for (int i = 0; i < 3; i++)
+            if (bpt_file_len(trees[i]) < lens[c][i]) ok = 0;
+        if (!ok) continue;   /* a tree lost this transaction: try the older one */
+        int e = BJ_OK;
+        for (int i = 0; i < 3 && !e; i++) e = bpt_rewind(trees[i], lens[c][i]);
+        return e;
+    }
+    /* The trees are behind every recorded transaction — more was lost than
+     * the journal can reconcile. Refuse rather than serve inconsistency. */
+    return BJ_ERR_STATE;
+}
+
 /* ---- add ------------------------------------------------------------ */
 
-int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths,
+int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
             const char *doc_id, int doc_id_len,
             const char *text, int text_len) {
     dict tf; dict_init(&tf);
@@ -571,6 +686,7 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths,
         dict_free(&merged);
     }
 
+    if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
     bj_builder_free(b);
     dict_free(&tf);
     return e;
@@ -578,7 +694,7 @@ int tix_add(bpt *index, bpt *doc_terms, bpt *doc_lengths,
 
 /* ---- remove --------------------------------------------------------- */
 
-int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths,
+int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal,
                const char *doc_id, int doc_id_len, int *removed) {
     *removed = 0;
     bpt_key kd = str_key(doc_id, doc_id_len);
@@ -598,6 +714,7 @@ int tix_remove(bpt *index, bpt *doc_terms, bpt *doc_lengths,
 
     if (!e) e = bpt_delete(doc_terms, &kd);
     if (!e) e = bpt_delete(doc_lengths, &kd);
+    if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
     if (!e) *removed = 1;
 
     bj_builder_free(b);
@@ -639,10 +756,11 @@ static int clear_tree(bpt *t) {
     return e;
 }
 
-int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths) {
+int tix_clear(bpt *index, bpt *doc_terms, bpt *doc_lengths, const bj_io *journal) {
     int e = clear_tree(index);
     if (!e) e = clear_tree(doc_terms);
     if (!e) e = clear_tree(doc_lengths);
+    if (!e && journal) e = tixj_commit(journal, index, doc_terms, doc_lengths);
     return e;
 }
 

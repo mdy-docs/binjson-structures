@@ -77,6 +77,10 @@ void bjfile_dispose(bjfile *f);
 /* Logical end of file: committed bytes plus pending appends. */
 uint64_t bjfile_len(const bjfile *f);
 
+/* Incremental CRC-32 (zlib polynomial; start from 0). Exposed for callers
+ * building their own checksummed records outside a bjfile. */
+uint32_t bjfile_crc32(uint32_t crc, const uint8_t *p, size_t n);
+
 /* Buffer an append of `n` bytes; writes its logical offset through *off. */
 int bjfile_append(bjfile *f, const uint8_t *b, size_t n, uint64_t *off);
 /* Write all pending appends to the host in one call. */

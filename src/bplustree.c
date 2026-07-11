@@ -1262,6 +1262,24 @@ void bpt_free(bpt *t) {
     free(t);
 }
 
+uint64_t bpt_file_len(const bpt *t) { return bjfile_len(&t->f); }
+
+int bpt_rewind(bpt *t, uint64_t len) {
+    uint64_t cur = bjfile_len(&t->f);
+    if (len == cur) return BJ_OK;
+    if (len > cur || len < BPT_METADATA_SIZE) return BJ_ERR_STATE;
+    const uint8_t *rec; size_t rec_len;
+    int e = bjfile_read_record(&t->f, len - BPT_METADATA_SIZE, &rec, &rec_len);
+    if (e) return e;
+    bpt_meta m;
+    if (rec_len != BPT_METADATA_SIZE ||
+        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
+        !meta_valid(&m, len - BPT_METADATA_SIZE)) return BJ_ERR_STATE;
+    if ((e = bjfile_set_len(&t->f, len))) return e;
+    meta_apply(t, &m);
+    return BJ_OK;
+}
+
 int64_t        bpt_size(const bpt *t)     { return t->size; }
 uint64_t       bpt_root(const bpt *t)     { return t->root; }
 uint64_t       bpt_next_id(const bpt *t)  { return t->next_id; }
