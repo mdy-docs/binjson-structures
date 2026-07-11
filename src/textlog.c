@@ -154,10 +154,9 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kn; uint32_t klen;
         if ((e = take_key(&c, &kn, &klen))) return e;
-        double d;
         if (name_eq(kn, klen, "type")) {
-            if ((e = read_number(&c, &d))) return e;
-            r->is_entry = 1; r->type = (int)d;
+            if ((e = read_int31(&c, &r->type))) return e;
+            r->is_entry = 1;
         } else if (name_eq(kn, klen, "version")) {
             if ((e = read_u64(&c, &r->version))) return e;
         } else if (name_eq(kn, klen, "hash")) {
@@ -175,8 +174,8 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
             if ((e = read_u64(&c, &u))) return e;
             r->diff_count = (int64_t)u;
         } else if (name_eq(kn, klen, "diffsPerSnapshot")) {
-            if ((e = read_number(&c, &d))) return e;
-            r->is_metadata = 1; r->diffs_per_snapshot = (int)d;
+            if ((e = read_int31(&c, &r->diffs_per_snapshot))) return e;
+            r->is_metadata = 1;
         } else {
             if ((e = skip_value(&c))) return e;
         }

@@ -24,6 +24,11 @@
  * rtree.js): 6 fields, all fixed-width INT/POINTER values. */
 #define RT_METADATA_SIZE 135
 
+/* Cap on tree depth while walking file-provided pointers: a corrupt file
+ * whose child pointer loops back to an ancestor must error, not recurse
+ * forever. Vastly deeper than any real tree (height is O(log n)). */
+#define RT_MAX_DEPTH 128
+
 /* ---- Bounding boxes ------------------------------------------------- */
 
 typedef struct {
@@ -171,7 +176,8 @@ static int parse_node(rtree *t, uint64_t offset, rnode *out) {
     int e = object_begin(&c, &count);
     if (e) return e;
 
-    int cb_n = -1;   /* childBBoxes element count, -1 = field absent */
+    int cb_n = -1;     /* childBBoxes element count, -1 = field absent */
+    int arr_leaf = -1; /* what the children array held, -1 = empty/absent */
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kn; uint32_t klen;
         if ((e = take_key(&c, &kn, &klen))) { node_free(out); return e; }
@@ -204,6 +210,7 @@ static int parse_node(rtree *t, uint64_t offset, rnode *out) {
             if (n > 0) {
                 if (cur_need(&c, 1)) { node_free(out); return BJ_ERR_EOF; }
                 is_leaf = c.d[c.pos] != BJ_TYPE_POINTER;
+                arr_leaf = is_leaf;
             } else {
                 is_leaf = out->is_leaf; /* empty: trust the flag read earlier */
             }
@@ -228,6 +235,13 @@ static int parse_node(rtree *t, uint64_t offset, rnode *out) {
         } else {
             if ((e = skip_value(&c))) { node_free(out); return e; }
         }
+    }
+    /* The isLeaf flag must agree with what the children array actually held
+     * (a corrupt/hostile file could claim internal over OBJECT entries and
+     * send later code through the NULL children array, or vice versa). */
+    if (arr_leaf >= 0 && arr_leaf != out->is_leaf) {
+        node_free(out);
+        return BJ_ERR_STATE;
     }
     /* childBBoxes is trusted only when it matches the child count exactly. */
     out->has_cb = (!out->is_leaf && cb_n == out->n && cb_n >= 0);
@@ -338,10 +352,9 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, rt_meta *m) {
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kn; uint32_t klen;
         if ((e = take_key(&c, &kn, &klen))) return e;
-        double d;
         uint64_t u;
-        if      (name_eq(kn, klen, "maxEntries")) { if ((e = read_number(&c, &d))) return e; m->max_entries = (int)d; }
-        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; m->min_entries = (int)d; }
+        if      (name_eq(kn, klen, "maxEntries")) { if ((e = read_int31(&c, &m->max_entries))) return e; }
+        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_int31(&c, &m->min_entries))) return e; }
         else if (name_eq(kn, klen, "size"))       { if ((e = read_u64(&c, &u))) return e; m->size = (int64_t)u; }
         else if (name_eq(kn, klen, "nextId"))     { if ((e = read_u64(&c, &m->next_id))) return e; }
         else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
@@ -558,8 +571,10 @@ static int choose_subtree(rtree *t, const rnode *nd, const rbbox *bb, int *out_i
     return BJ_OK;
 }
 
-static int insert_node(rtree *t, uint64_t ptr, const rentry *entry, ins_res *out) {
+static int insert_node(rtree *t, uint64_t ptr, const rentry *entry, ins_res *out,
+                       int depth) {
     memset(out, 0, sizeof(*out));
+    if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     rnode nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -586,10 +601,11 @@ static int insert_node(rtree *t, uint64_t ptr, const rentry *entry, ins_res *out
 
     int idx;
     e = choose_subtree(t, &nd, &entry->bbox, &idx);
+    if (!e && idx < 0) e = BJ_ERR_STATE;   /* childless internal node */
     if (e) { node_free(&nd); return e; }
 
     ins_res cr;
-    e = insert_node(t, nd.children[idx], entry, &cr);
+    e = insert_node(t, nd.children[idx], entry, &cr, depth + 1);
     if (e) { node_free(&nd); return e; }
 
     if (cr.split) {
@@ -628,7 +644,7 @@ static int insert_root(rtree *t, double lat, double lng, const uint8_t *oid12) {
     memcpy(entry.oid, oid12, 12);
 
     ins_res res;
-    int e = insert_node(t, t->root, &entry, &res);
+    int e = insert_node(t, t->root, &entry, &res, 0);
     if (e) return e;
 
     if (res.split) {
@@ -809,8 +825,10 @@ done:
     return e;
 }
 
-static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out) {
+static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out,
+                       int depth) {
     memset(out, 0, sizeof(*out));
+    if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     rnode nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -838,7 +856,7 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out)
 
     for (int i = 0; i < nd.n; i++) {
         del_res cr;
-        e = remove_node(t, updated[i], oid, &cr);
+        e = remove_node(t, updated[i], oid, &cr, depth + 1);
         if (e) { free(updated); node_free(&nd); return e; }
         if (!cr.found) { continue; }
 
@@ -887,7 +905,7 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out)
 
 static int remove_root(rtree *t, const uint8_t *oid12, int *removed) {
     del_res res;
-    int e = remove_node(t, t->root, oid12, &res);
+    int e = remove_node(t, t->root, oid12, &res, 0);
     if (e) return e;
     if (!res.found) { *removed = 0; return BJ_OK; }
 
@@ -941,7 +959,9 @@ int rtree_clear(rtree *t) {
 
 /* ---- Search --------------------------------------------------------- */
 
-static int search_rec(rtree *t, uint64_t ptr, const rbbox *q, bj_builder *b) {
+static int search_rec(rtree *t, uint64_t ptr, const rbbox *q, bj_builder *b,
+                      int depth) {
+    if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     rnode nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -963,7 +983,7 @@ static int search_rec(rtree *t, uint64_t ptr, const rbbox *q, bj_builder *b) {
             if (nd.has_cb &&
                 (!nd.child_bboxes[i].valid || !bbox_intersects(q, &nd.child_bboxes[i])))
                 continue;
-            e = search_rec(t, nd.children[i], q, b);
+            e = search_rec(t, nd.children[i], q, b, depth + 1);
             if (e) { node_free(&nd); return e; }
         }
     }
@@ -978,7 +998,7 @@ int rtree_search_bbox(rtree *t, double min_lat, double max_lat,
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     bj_begin_array(b);
-    int e = search_rec(t, t->root, &q, b);
+    int e = search_rec(t, t->root, &q, b, 0);
     bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -994,7 +1014,9 @@ int rtree_search_bbox(rtree *t, double min_lat, double max_lat,
 /* Like search_rec, but filters leaf entries by haversine distance and emits a
  * `distance` field (mirrors src/rtree.js searchRadius / _searchBBoxEntries). */
 static int search_radius_rec(rtree *t, uint64_t ptr, const rbbox *q,
-                             double lat, double lng, double radius_km, bj_builder *b) {
+                             double lat, double lng, double radius_km,
+                             bj_builder *b, int depth) {
+    if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     rnode nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -1017,7 +1039,8 @@ static int search_radius_rec(rtree *t, uint64_t ptr, const rbbox *q,
             if (nd.has_cb &&
                 (!nd.child_bboxes[i].valid || !bbox_intersects(q, &nd.child_bboxes[i])))
                 continue;
-            e = search_radius_rec(t, nd.children[i], q, lat, lng, radius_km, b);
+            e = search_radius_rec(t, nd.children[i], q, lat, lng, radius_km,
+                                  b, depth + 1);
             if (e) { node_free(&nd); return e; }
         }
     }
@@ -1033,7 +1056,7 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     bj_begin_array(b);
-    int e = search_radius_rec(t, t->root, &q, lat, lng, radius_km, b);
+    int e = search_radius_rec(t, t->root, &q, lat, lng, radius_km, b, 0);
     bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -1047,11 +1070,6 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
 }
 
 /* ---- Compaction ----------------------------------------------------- */
-
-/* Cap on tree depth while walking file-provided pointers: a corrupt file
- * whose child pointer loops back to an ancestor must error, not recurse
- * forever. Vastly deeper than any real tree (height is O(log n)). */
-#define RT_MAX_DEPTH 128
 
 /* Open-addressing old-offset -> new-offset map (offsets are exact u64s). */
 typedef struct { uint64_t *olds, *news; uint8_t *used; size_t n, cap; } ptrmap;

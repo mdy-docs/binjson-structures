@@ -280,6 +280,14 @@ static int parse_node(bpt *t, uint64_t offset, bpt_node *out) {
         }
         if (e) { node_free(out); return e; }
     }
+    /* Structural invariants every writer (JS and C) maintains. A violating
+     * node is a corrupt or hostile file and would otherwise cause
+     * out-of-bounds child/value indexing in the traversals. */
+    if (out->is_leaf ? (out->n_values != out->n_keys)
+                     : (out->n_children != out->n_keys + 1)) {
+        node_free(out);
+        return BJ_ERR_STATE;
+    }
     return BJ_OK;
 }
 
@@ -379,10 +387,9 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, bpt_meta *m) {
         const uint8_t *kn = c.d + c.pos;
         c.pos += klen;
         int e = BJ_OK;
-        double d;
         uint64_t u;
-        if (name_eq(kn, klen, "maxEntries"))      { if ((e = read_number(&c, &d))) return e; m->order = (int)d; }
-        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_number(&c, &d))) return e; m->min_keys = (int)d; }
+        if (name_eq(kn, klen, "maxEntries"))      { if ((e = read_int31(&c, &m->order))) return e; }
+        else if (name_eq(kn, klen, "minEntries")) { if ((e = read_int31(&c, &m->min_keys))) return e; }
         else if (name_eq(kn, klen, "size"))       { if ((e = read_u64(&c, &u))) return e; m->size = (int64_t)u; }
         else if (name_eq(kn, klen, "nextId"))     { if ((e = read_u64(&c, &m->next_id))) return e; }
         else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
@@ -420,8 +427,9 @@ typedef struct {
 } add_res;
 
 static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
-                    const uint8_t *val, uint32_t vlen, add_res *out) {
+                    const uint8_t *val, uint32_t vlen, add_res *out, int depth) {
     memset(out, 0, sizeof(*out));
+    if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
     bpt_node nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -476,7 +484,7 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
     while (childIdx < nd.n_keys && key_cmp(key, &nd.keys[childIdx]) >= 0) childIdx++;
 
     add_res cr;
-    e = add_node(t, nd.children[childIdx], key, val, vlen, &cr);
+    e = add_node(t, nd.children[childIdx], key, val, vlen, &cr, depth + 1);
     if (e) { node_free(&nd); return e; }
 
     if (!cr.is_split) {
@@ -533,7 +541,7 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
 
 static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
     add_res res;
-    int e = add_node(t, t->root, key, val, vlen, &res);
+    int e = add_node(t, t->root, key, val, vlen, &res, 0);
     if (e) return e;
 
     bpt_node new_root;
@@ -582,8 +590,10 @@ int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
 
 typedef struct { int found; bpt_node node; } del_res;
 
-static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out) {
+static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out,
+                    int depth) {
     memset(out, 0, sizeof(*out));
+    if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
     bpt_node nd;
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
@@ -612,7 +622,7 @@ static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out) {
     int i = 0;
     while (i < nd.n_keys && key_cmp(key, &nd.keys[i]) >= 0) i++;
     del_res cr;
-    e = del_node(t, nd.children[i], key, &cr);
+    e = del_node(t, nd.children[i], key, &cr, depth + 1);
     if (e) { node_free(&nd); return e; }
     if (!cr.found) { out->found = 0; node_free(&nd); return BJ_OK; }
 
@@ -633,7 +643,7 @@ static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out) {
 
 static int delete_root(bpt *t, const bpt_key *key) {
     del_res res;
-    int e = del_node(t, t->root, key, &res);
+    int e = del_node(t, t->root, key, &res, 0);
     if (e) return e;
     if (!res.found) return BJ_OK;   /* key not present: no-op */
 
@@ -672,7 +682,8 @@ int bpt_delete(bpt *t, const bpt_key *key) {
 int bpt_search(bpt *t, const bpt_key *key, int *found,
                const uint8_t **out_ptr, size_t *out_len) {
     uint64_t ptr = t->root;
-    for (;;) {
+    for (int depth = 0; ; depth++) {
+        if (depth > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
         bpt_node nd;
         int e = parse_node(t, ptr, &nd);
         if (e) return e;
@@ -926,6 +937,7 @@ int bpt_height(bpt *t, int *out_height) {
     int h = 0;
     uint64_t ptr = t->root;
     for (;;) {
+        if (h > BPT_MAX_DEPTH) return BJ_ERR_DEPTH;
         bpt_node nd;
         int e = parse_node(t, ptr, &nd);
         if (e) return e;

@@ -18,9 +18,14 @@
 typedef struct { uint8_t *data; size_t len, cap; } dbuf;
 
 static inline int dbuf_ensure(dbuf *b, size_t extra) {
-    if (b->len + extra <= b->cap) return BJ_OK;
+    if (extra <= b->cap - b->len) return BJ_OK;   /* len <= cap invariant */
+    if (extra > ((size_t)-1) - b->len) return BJ_ERR_OOM;
+    size_t need = b->len + extra;
     size_t nc = b->cap ? b->cap : 256;
-    while (nc < b->len + extra) nc *= 2;
+    while (nc < need) {
+        if (nc > ((size_t)-1) / 2) return BJ_ERR_OOM;   /* overflow guard */
+        nc *= 2;
+    }
     uint8_t *nb = (uint8_t *)realloc(b->data, nc);
     if (!nb) return BJ_ERR_OOM;
     b->data = nb; b->cap = nc;

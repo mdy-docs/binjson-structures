@@ -126,6 +126,17 @@ static inline int read_u64(cur *c, uint64_t *out) {
     *out = (uint64_t)d;
     return BJ_OK;
 }
+/* Like read_u64, but the value must also fit in an int (small counts and
+ * enums). Casting an unchecked double to int is undefined behavior for
+ * out-of-range values, so hostile files must be rejected before the cast. */
+static inline int read_int31(cur *c, int *out) {
+    uint64_t u;
+    int e = read_u64(c, &u);
+    if (e) return e;
+    if (u > 0x7fffffff) return BJ_ERR_STATE;
+    *out = (int)u;
+    return BJ_OK;
+}
 static inline int take_string(cur *c, const uint8_t **p, uint32_t *len) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;

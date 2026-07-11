@@ -271,9 +271,10 @@ int bjfile_check_header(bjfile *f, const char *type) {
         if (k2 == 3 && pos + 3 + 9 <= len && memcmp(rec + pos, "fmt", 3) == 0) {
             pos += 3;
             if (rec[pos] == BJ_TYPE_INT) {
-                int64_t fmt = 0;
-                for (int i = 7; i >= 0; i--) fmt = (fmt << 8) | rec[pos + 1 + i];
-                if (fmt > 1) return BJ_ERR_STATE;
+                uint64_t ufmt = 0;
+                for (int i = 7; i >= 0; i--) ufmt = (ufmt << 8) | rec[pos + 1 + i];
+                int64_t fmt = (int64_t)ufmt;
+                if (fmt < 0 || fmt > 1) return BJ_ERR_STATE;
             }
         }
     }
