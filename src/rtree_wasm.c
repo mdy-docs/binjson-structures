@@ -37,6 +37,14 @@ EMSCRIPTEN_KEEPALIVE int rtw_insert(rtree *t, double lat, double lng, const uint
 }
 
 /* Returns 1 if an entry was removed, 0 if not found, negative on error. */
+EMSCRIPTEN_KEEPALIVE int rtw_remove_at(rtree *t, double lat, double lng,
+                                       const uint8_t *oid) {
+    int removed = 0;
+    int e = rtree_remove_at(t, lat, lng, oid, &removed);
+    if (e) return e;
+    return removed ? 1 : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE int rtw_remove(rtree *t, const uint8_t *oid) {
     int removed = 0;
     int e = rtree_remove(t, oid, &removed);

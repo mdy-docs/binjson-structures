@@ -55,6 +55,16 @@ const uint8_t *rtree_out(const rtree *t, size_t *len);
 int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12);
 /* Remove the first entry matching `oid12`. Writes 1/0 to *removed. */
 int rtree_remove(rtree *t, const uint8_t *oid12, int *removed);
+/*
+ * Remove by OID with its known location. OIDs have no spatial locality, so
+ * rtree_remove probes subtrees in order (worst-case a full-tree scan);
+ * supplying the entry's stored coordinates lets bbox pruning skip every
+ * subtree that cannot contain the point — O(height) on well-separated
+ * trees. The point must equal the coordinates the entry was inserted with;
+ * a different point simply finds nothing (*removed = 0).
+ */
+int rtree_remove_at(rtree *t, double lat, double lng, const uint8_t *oid12,
+                    int *removed);
 /* Drop all entries by appending a fresh empty root. */
 int rtree_clear(rtree *t);
 

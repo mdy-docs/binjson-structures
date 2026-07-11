@@ -825,8 +825,11 @@ done:
     return e;
 }
 
-static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out,
-                       int depth) {
+/* `q` (the removed entry's point, when the caller knows it) prunes the
+ * descent: subtrees whose bbox cannot contain the point are skipped instead
+ * of probed. NULL falls back to the in-order full probe. */
+static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid,
+                       const rbbox *q, del_res *out, int depth) {
     memset(out, 0, sizeof(*out));
     if (depth > RT_MAX_DEPTH) return BJ_ERR_DEPTH;
     rnode nd;
@@ -856,7 +859,13 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out,
 
     for (int i = 0; i < nd.n; i++) {
         del_res cr;
-        e = remove_node(t, updated[i], oid, &cr, depth + 1);
+        if (q) {
+            rbbox cb;
+            e = child_bbox(t, &nd, i, &cb);
+            if (e) { free(updated); node_free(&nd); return e; }
+            if (!cb.valid || !bbox_intersects(q, &cb)) continue;
+        }
+        e = remove_node(t, updated[i], oid, q, &cr, depth + 1);
         if (e) { free(updated); node_free(&nd); return e; }
         if (!cr.found) { continue; }
 
@@ -903,9 +912,9 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid, del_res *out,
     return BJ_OK;
 }
 
-static int remove_root(rtree *t, const uint8_t *oid12, int *removed) {
+static int remove_root(rtree *t, const uint8_t *oid12, const rbbox *q, int *removed) {
     del_res res;
-    int e = remove_node(t, t->root, oid12, &res, 0);
+    int e = remove_node(t, t->root, oid12, q, &res, 0);
     if (e) return e;
     if (!res.found) { *removed = 0; return BJ_OK; }
 
@@ -921,16 +930,26 @@ static int remove_root(rtree *t, const uint8_t *oid12, int *removed) {
     return save_metadata(t);
 }
 
-int rtree_remove(rtree *t, const uint8_t *oid12, int *removed) {
+static int remove_with(rtree *t, const uint8_t *oid12, const rbbox *q, int *removed) {
     uint64_t root = t->root, next_id = t->next_id;
     int64_t size = t->size;
-    int e = remove_root(t, oid12, removed);
+    int e = remove_root(t, oid12, q, removed);
     if (!e) e = bjfile_commit(&t->f);
     if (e) {
         bjfile_discard(&t->f);
         t->root = root; t->next_id = next_id; t->size = size;
     }
     return e;
+}
+
+int rtree_remove(rtree *t, const uint8_t *oid12, int *removed) {
+    return remove_with(t, oid12, NULL, removed);
+}
+
+int rtree_remove_at(rtree *t, double lat, double lng, const uint8_t *oid12,
+                    int *removed) {
+    rbbox q = { 1, lat, lat, lng, lng };
+    return remove_with(t, oid12, &q, removed);
 }
 
 /* ---- Clear ---------------------------------------------------------- */
