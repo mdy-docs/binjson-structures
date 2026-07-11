@@ -54,6 +54,7 @@ struct bpt {
     int64_t    size;
     int        order;
     int        min_keys;
+    int        read_only;   /* snapshot handle: mutations disabled */
 };
 
 /* ---- Key helpers ---------------------------------------------------- */
@@ -575,6 +576,7 @@ static int add_root(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vle
  * the in-memory state is rolled back, leaving the file untouched.
  */
 int bpt_add(bpt *t, const bpt_key *key, const uint8_t *val, uint32_t vlen) {
+    if (t->read_only) return BJ_ERR_STATE;
     uint64_t root = t->root, next_id = t->next_id;
     int64_t size = t->size;
     int e = add_root(t, key, val, vlen);
@@ -666,6 +668,7 @@ static int delete_root(bpt *t, const bpt_key *key) {
 }
 
 int bpt_delete(bpt *t, const bpt_key *key) {
+    if (t->read_only) return BJ_ERR_STATE;
     uint64_t root = t->root, next_id = t->next_id;
     int64_t size = t->size;
     int e = delete_root(t, key);
@@ -1264,7 +1267,116 @@ void bpt_free(bpt *t) {
 
 uint64_t bpt_file_len(const bpt *t) { return bjfile_len(&t->f); }
 
+/* ---- Snapshots (MVCC) ------------------------------------------------- */
+
+int bpt_is_snapshot(const bpt *t) { return t->read_only; }
+
+bpt *bpt_snapshot(const bpt *t) {
+    bpt *s = (bpt *)calloc(1, sizeof(bpt));
+    if (!s) return NULL;
+    s->bld = bj_builder_new();
+    if (!s->bld) { free(s); return NULL; }
+    bjfile_init(&s->f, &t->f.io);
+    s->order = t->order;
+    s->min_keys = t->min_keys;
+    s->root = t->root;
+    s->next_id = t->next_id;
+    s->size = t->size;
+    s->read_only = 1;
+    return s;
+}
+
+bpt *bpt_open_at(const bj_io *io, uint64_t len) {
+    bpt *t = (bpt *)calloc(1, sizeof(bpt));
+    if (!t) return NULL;
+    t->bld = bj_builder_new();
+    if (!t->bld) { free(t); return NULL; }
+    bjfile_init(&t->f, io);
+    if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
+    if (len < BPT_METADATA_SIZE || len > bjfile_len(&t->f)) { bpt_free(t); return NULL; }
+    const uint8_t *rec; size_t rec_len;
+    bpt_meta m;
+    if (bjfile_read_record(&t->f, len - BPT_METADATA_SIZE, &rec, &rec_len) ||
+        rec_len != BPT_METADATA_SIZE ||
+        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
+        !meta_valid(&m, len - BPT_METADATA_SIZE)) {
+        bpt_free(t);
+        return NULL;
+    }
+    meta_apply(t, &m);
+    t->read_only = 1;
+    return t;
+}
+
+/* Boundary accumulator for the commit scan. */
+typedef struct {
+    uint64_t *offs; int64_t *sizes;
+    int n, cap;
+} bnd_list;
+
+static int boundaries_cb(void *ctx, uint64_t off, const uint8_t *rec,
+                         size_t rec_len, int *is_commit_end) {
+    bnd_list *bl = (bnd_list *)ctx;
+    if (rec_len != BPT_METADATA_SIZE) return BJ_OK;
+    bpt_meta m;
+    if (parse_meta_rec(rec, rec_len, &m) != BJ_OK || !meta_valid(&m, off)) return BJ_OK;
+    *is_commit_end = 1;
+    if (bl->n == bl->cap) {
+        int nc = bl->cap ? bl->cap * 2 : 32;
+        uint64_t *no = (uint64_t *)realloc(bl->offs, (size_t)nc * sizeof(uint64_t));
+        int64_t *ns = (int64_t *)realloc(bl->sizes, (size_t)nc * sizeof(int64_t));
+        if (no) bl->offs = no;
+        if (ns) bl->sizes = ns;
+        if (!no || !ns) return BJ_ERR_OOM;
+        bl->cap = nc;
+    }
+    bl->offs[bl->n] = off + rec_len;
+    bl->sizes[bl->n] = m.size;
+    bl->n++;
+    return BJ_OK;
+}
+
+int bpt_boundaries(bpt *t, const uint8_t **out_ptr, size_t *out_len) {
+    bnd_list bl;
+    memset(&bl, 0, sizeof(bl));
+    uint64_t good = 0;
+    int e = bjfile_scan_commits(&t->f, boundaries_cb, &bl, &good);
+    if (!e) {
+        /* Keep only boundaries inside verified commits. */
+        while (bl.n > 0 && bl.offs[bl.n - 1] > good) bl.n--;
+        bj_builder *b = bj_builder_new();
+        if (!b) e = BJ_ERR_OOM;
+        else {
+            bj_begin_array(b);
+            for (int i = 0; i < bl.n; i++) {
+                bj_begin_object(b);
+                bj_put_key(b, (const uint8_t *)"offset", 6);
+                bj_put_int(b, (int64_t)bl.offs[i]);
+                bj_put_key(b, (const uint8_t *)"size", 4);
+                bj_put_int(b, bl.sizes[i]);
+                bj_end_object(b);
+            }
+            bj_end_array(b);
+            e = bj_builder_error(b);
+            if (!e) {
+                size_t len;
+                const uint8_t *d = bj_builder_data(b, &len);
+                if (!d) e = BJ_ERR_STATE;
+                else if (!(e = set_out(t, d, len))) {
+                    *out_ptr = t->out.data;
+                    *out_len = t->out.len;
+                }
+            }
+            bj_builder_free(b);
+        }
+    }
+    free(bl.offs);
+    free(bl.sizes);
+    return e;
+}
+
 int bpt_rewind(bpt *t, uint64_t len) {
+    if (t->read_only) return BJ_ERR_STATE;
     uint64_t cur = bjfile_len(&t->f);
     if (len == cur) return BJ_OK;
     if (len > cur || len < BPT_METADATA_SIZE) return BJ_ERR_STATE;

@@ -96,6 +96,38 @@ int bpt_rewind(bpt *t, uint64_t len);
  */
 int bpt_compact(bpt *t, const bj_io *dst);
 
+/* ---- Snapshots (MVCC) -------------------------------------------------- */
+
+/*
+ * The tree is append-only and immutable: every commit boundary in the file
+ * is a complete, consistent snapshot (root pointer + size), and later
+ * appends never disturb it. These functions expose that.
+ *
+ * A snapshot is an ordinary bpt handle with mutations disabled; every read
+ * API (search / entries / range / cursors / height / compact) works
+ * unchanged. Snapshots share the live tree's io, so they stay valid as long
+ * as the underlying file is only appended to — truncating or replacing it
+ * (bpt_rewind, adopting a compaction) invalidates them. Free with bpt_free.
+ */
+
+/* Read-only handle pinned at `t`'s current root. Returns NULL on OOM. */
+bpt *bpt_snapshot(const bpt *t);
+/*
+ * Read-only handle pinned at the historical commit boundary `len` (the file
+ * length as of that commit — see bpt_boundaries). Returns NULL if the bytes
+ * there are not a valid metadata record.
+ */
+bpt *bpt_open_at(const bj_io *io, uint64_t len);
+/*
+ * Enumerate the verified commit boundaries, oldest first, as a binjson
+ * ARRAY of { offset, size } — offset is the file length to pass to
+ * bpt_open_at, size the entry count at that commit. Exposed via
+ * out_ptr/out_len (valid until the next operation on `t`). Scans the file.
+ */
+int bpt_boundaries(bpt *t, const uint8_t **out_ptr, size_t *out_len);
+/* 1 when the handle is a read-only snapshot. */
+int bpt_is_snapshot(const bpt *t);
+
 /* ---- Cursors ---------------------------------------------------------- */
 
 /*

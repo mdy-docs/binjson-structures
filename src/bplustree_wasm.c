@@ -43,6 +43,24 @@ EMSCRIPTEN_KEEPALIVE bpt *bptw_create(int fd, int order) {
     bj_io io = bjio_host(fd);
     return bpt_create(&io, order);
 }
+EMSCRIPTEN_KEEPALIVE bpt *bptw_snapshot(bpt *t) {
+    return bpt_snapshot(t);
+}
+
+EMSCRIPTEN_KEEPALIVE bpt *bptw_open_at(int fd, double len) {
+    bj_io io = bjio_host(fd);
+    return bpt_open_at(&io, (uint64_t)len);
+}
+
+EMSCRIPTEN_KEEPALIVE int bptw_boundaries(bpt *t) {
+    g_out_ptr = NULL; g_out_len = 0;
+    return bpt_boundaries(t, &g_out_ptr, &g_out_len);
+}
+
+EMSCRIPTEN_KEEPALIVE int bptw_is_snapshot(bpt *t) {
+    return bpt_is_snapshot(t);
+}
+
 EMSCRIPTEN_KEEPALIVE bpt *bptw_open(int fd) {
     bj_io io = bjio_host(fd);
     return bpt_open(&io);
