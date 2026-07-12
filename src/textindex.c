@@ -115,25 +115,41 @@ static void dict_remove(dict *d, const char *k, int klen) {
 
 /* ---- Stop words (verbatim from src/textindex.js) -------------------- */
 
+/* Kept in strcmp order so is_stopword can binary-search. */
 static const char *const STOPWORDS[] = {
     "a","about","after","all","also","am","an","and","another","any","are",
-    "around","as","at","be","because","been","before","being","between","both",
-    "but","by","came","can","come","could","did","do","each","for","from",
-    "get","got","has","had","he","have","her","here","him","himself","his",
-    "how","i","if","in","into","is","it","like","make","many","me","might",
+    "around","as","at","be","because","been","before","being","between","both","but",
+    "by","came","can","come","could","did","do","each","for","from","get",
+    "got","had","has","have","he","her","here","him","himself","his","how",
+    "i","if","in","into","is","it","like","make","many","me","might",
     "more","most","much","must","my","never","now","of","on","only","or",
-    "other","our","out","over","said","same","see","should","since","some",
-    "still","such","take","than","that","the","their","them","then","there",
-    "these","they","this","those","through","to","too","under","up","very",
-    "was","way","we","well","were","what","where","which","while","who",
-    "with","would","you","your"
+    "other","our","out","over","said","same","see","should","since","some","still",
+    "such","take","than","that","the","their","them","then","there","these","they",
+    "this","those","through","to","too","under","up","very","was","way","we",
+    "well","were","what","where","which","while","who","with","would","you","your"
 };
 static const int STOPWORDS_N = (int)(sizeof STOPWORDS / sizeof STOPWORDS[0]);
 
+/* strcmp-style compare of NUL-terminated stopword `s` against the
+ * non-terminated (`w`, `wlen`); sign follows `w` relative to `s`. */
+static int sw_cmp(const char *s, const char *w, int wlen) {
+    for (int i = 0; i < wlen; i++) {
+        unsigned char sc = (unsigned char)s[i];
+        if (sc == 0) return 1;                       /* s ended first: w > s */
+        unsigned char wc = (unsigned char)w[i];
+        if (wc != sc) return (int)wc - (int)sc;
+    }
+    return s[wlen] == 0 ? 0 : -1;                     /* s continues: w < s */
+}
+
 static int is_stopword(const char *w, int len) {
-    for (int i = 0; i < STOPWORDS_N; i++) {
-        const char *s = STOPWORDS[i];
-        if ((int)strlen(s) == len && memcmp(s, w, (size_t)len) == 0) return 1;
+    int lo = 0, hi = STOPWORDS_N - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        int c = sw_cmp(STOPWORDS[mid], w, len);
+        if (c == 0) return 1;
+        if (c < 0) hi = mid - 1;
+        else       lo = mid + 1;
     }
     return 0;
 }
@@ -884,8 +900,27 @@ static int doc_length(bpt *doc_lengths, dict *lenmap,
 }
 
 /* Stable sort indices [0..n) by descending score (insertion order preserved
- * for equal scores, matching JS's stable Array.prototype.sort). */
-static void stable_sort_desc(int *idx, const double *score, int n) {
+ * for equal scores, matching JS's stable Array.prototype.sort). Bottom-up
+ * merge sort, O(n log n) — broad queries can score thousands of docs, where
+ * an O(n^2) insertion sort dominated. `tmp` is scratch of length >= n; on
+ * allocation failure the caller falls back to insertion sort. */
+static void merge_sort_desc(int *idx, int *tmp, const double *score, int n) {
+    for (int width = 1; width < n; width *= 2) {
+        for (int lo = 0; lo < n; lo += 2 * width) {
+            int mid = lo + width < n ? lo + width : n;
+            int hi = lo + 2 * width < n ? lo + 2 * width : n;
+            int i = lo, j = mid, k = lo;
+            /* `<=` on the left keeps equal scores in original order (stable). */
+            while (i < mid && j < hi)
+                tmp[k++] = score[idx[i]] >= score[idx[j]] ? idx[i++] : idx[j++];
+            while (i < mid) tmp[k++] = idx[i++];
+            while (j < hi)  tmp[k++] = idx[j++];
+        }
+        for (int t = 0; t < n; t++) idx[t] = tmp[t];
+    }
+}
+
+static void insertion_sort_desc(int *idx, const double *score, int n) {
     for (int i = 1; i < n; i++) {
         int cur_i = idx[i];
         double s = score[cur_i];
@@ -893,6 +928,13 @@ static void stable_sort_desc(int *idx, const double *score, int n) {
         while (j >= 0 && score[idx[j]] < s) { idx[j + 1] = idx[j]; j--; }
         idx[j + 1] = cur_i;
     }
+}
+
+static void stable_sort_desc(int *idx, const double *score, int n) {
+    if (n < 2) return;
+    int *tmp = malloc((size_t)n * sizeof(int));
+    if (tmp) { merge_sort_desc(idx, tmp, score, n); free(tmp); }
+    else insertion_sort_desc(idx, score, n);   /* tiny n or OOM: still correct */
 }
 
 /* Emit an empty binjson ARRAY. */
