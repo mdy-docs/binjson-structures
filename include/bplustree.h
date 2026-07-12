@@ -34,11 +34,31 @@
 extern "C" {
 #endif
 
-/* A comparable key: a JS number or a JS string. */
+/*
+ * A comparable key: a JS number or a JS string. String keys are compared
+ * byte-for-byte (memcmp, then length) and stored verbatim — they are opaque
+ * byte strings, not required to be valid UTF-8, so an arbitrary byte sequence
+ * is a legal key.
+ *
+ * Duplicate keys / secondary indexes. The tree is unique-key by design:
+ * bpt_add is an upsert (a second add of an existing key replaces its value).
+ * This is deliberate — native duplicate keys would complicate search, delete,
+ * node splitting, the bpt_verify invariants, and snapshot semantics, for a
+ * pattern the existing pruned range scan and cursor already serve. To index a
+ * column that is not unique, compose a unique key from the indexed value
+ * followed by the primary key:  key = enc(secondaryValue) ‖ enc(primaryKey),
+ * where enc() is an order-preserving byte encoding (numbers as sign-normalized
+ * big-endian f64, strings as their bytes with a 0x00 terminator, so byte order
+ * matches value order and the parts stay self-delimiting). All entries sharing
+ * a secondary value are then a contiguous range, retrieved with one
+ * bpt_range / cursor scan over [enc(v), enc(v)‖0xff...]; the row reference
+ * lives in the value, so the composite key never needs decoding. The JS
+ * wrapper exposes this as orderedKey()/compositeKey() over byte-string keys.
+ */
 typedef struct {
-    int      is_string;   /* 0 = number, 1 = string        */
+    int      is_string;   /* 0 = number, 1 = string (opaque bytes) */
     double   num;         /* when is_string == 0           */
-    const uint8_t *str;   /* when is_string == 1 (utf8)    */
+    const uint8_t *str;   /* when is_string == 1           */
     uint32_t str_len;
 } bpt_key;
 
