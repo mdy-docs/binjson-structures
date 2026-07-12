@@ -85,7 +85,15 @@ void rtree_cursor_close(rtree_cursor *c);
 int rtree_nearest(rtree *t, double lat, double lng, int k,
                   const uint8_t **out_ptr, size_t *out_len);
 
-/* Insert a point (lat, lng) with a 12-byte ObjectId. */
+/*
+ * Insert a point (lat, lng) with a 12-byte ObjectId.
+ *
+ * OID uniqueness is the caller's contract: the tree never checks for
+ * duplicates, so inserting the same OID twice stores two independent
+ * entries, both searches return both, and one remove takes out only one
+ * (whichever probing finds first). A storage engine keying rows by OID
+ * must guarantee uniqueness above this layer.
+ */
 int rtree_insert(rtree *t, double lat, double lng, const uint8_t *oid12);
 /* Remove the first entry matching `oid12`. Writes 1/0 to *removed. */
 int rtree_remove(rtree *t, const uint8_t *oid12, int *removed);

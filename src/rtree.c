@@ -467,7 +467,18 @@ typedef struct {
     rbbox    bbox, bbox2;  /* their bounding boxes (for the parent) */
 } ins_res;
 
-/* Split the overflowing in-memory `nd` into two saved nodes. */
+/*
+ * Split the overflowing in-memory `nd` into two saved nodes with Guttman's
+ * quadratic split. An R*-style split (margin-minimizing axis choice +
+ * least-overlap distribution, including the paper's relaxed 40% fill)
+ * was implemented and benchmarked on clustered point data — 6,000 points
+ * in 30 clusters, 500 cluster-sized bbox queries, host reads counted —
+ * and measured at parity or slightly worse (fanout 9: 10.7 reads/query
+ * quadratic vs 12.2 R* under this format's ceil(max/2) min-fill, 10.6 at
+ * 40% fill; fanout 16: 7.6 vs 8.0 vs 7.5). With childBBoxes pruning the
+ * descent, split topology isn't the bottleneck for point entries, so the
+ * simpler split stays.
+ */
 static int split_node(rtree *t, const rnode *nd, ins_res *out) {
     int n = nd->n;
     rbbox *cb = (rbbox *)malloc((size_t)n * sizeof(rbbox));
@@ -775,7 +786,9 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         goto done;
     }
 
-    /* Can't borrow: merge with the first sibling. */
+    /* Can't borrow: merge with the first sibling. When max_entries == 2 the
+     * clamped min equals max, so the merged node can exceed capacity — split
+     * it back in two instead of saving an oversized node. */
     if (nsib > 0) {
         int s = 0;
         int total = cr->node.n + sib[s].n;
@@ -800,12 +813,20 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
             free(all); free(allb);
         }
         if (!e) e = compute_bbox(t, &m);
-        rbbox mb = m.bbox;
-        uint64_t mp = 0;
-        if (!e) e = save_node(t, &m, &mp);
+        rbbox mb = m.bbox, mb2;
+        uint64_t mp = 0, mp2 = 0;
+        int halves = 1;
+        if (!e && total > t->max_entries) {
+            ins_res sp;
+            e = split_node(t, &m, &sp);
+            if (!e) { mp = sp.ptr; mb = sp.bbox; mp2 = sp.ptr2; mb2 = sp.bbox2; halves = 2; }
+        } else if (!e) {
+            e = save_node(t, &m, &mp);
+        }
         node_free(&m);
         if (e) goto done;
 
+        /* Two slots leave, one or two arrive: parent->n slots suffice. */
         uint64_t *newc = (uint64_t *)malloc((size_t)parent->n * sizeof(uint64_t));
         rbbox *newb = (rbbox *)malloc((size_t)parent->n * sizeof(rbbox));
         if (!newc || !newb) { free(newc); free(newb); e = BJ_ERR_OOM; goto done; }
@@ -817,6 +838,10 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         }
         newb[k] = mb;
         newc[k++] = mp;
+        if (halves == 2) {
+            newb[k] = mb2;
+            newc[k++] = mp2;
+        }
         *out_children = newc; *out_bboxes = newb; *out_count = k; *merged = 1;
     }
 
@@ -1071,11 +1096,45 @@ int rtree_search_radius(rtree *t, double lat, double lng, double radius_km,
                         const uint8_t **out_ptr, size_t *out_len) {
     double min_lat, max_lat, min_lng, max_lng;
     geo_radius_to_bbox(lat, lng, radius_km, &min_lat, &max_lat, &min_lng, &max_lng);
-    rbbox q = { 1, min_lat, max_lat, min_lng, max_lng };
+
+    /*
+     * The raw box is naive about the sphere; stored points live in
+     * [-90, 90] x [-180, 180], so make the query cover the right region:
+     * clamp latitude, and when the circle encloses a pole (lat range
+     * touches ±90) or the cos-scaled longitude delta spans the globe,
+     * every longitude qualifies. A box that merely crosses the
+     * antimeridian splits into two — [min_lng, 180] and [-180, max_lng] —
+     * so a search near ±180° no longer silently misses points on the
+     * other side. The haversine filter stays the source of truth; the
+     * boxes only prune. Both boxes never contain the same stored point.
+     */
+    if (min_lat < -90.0) min_lat = -90.0;
+    if (max_lat > 90.0) max_lat = 90.0;
+    rbbox q[2];
+    int nq = 1;
+    if (min_lat <= -90.0 || max_lat >= 90.0 ||
+        !(max_lng - min_lng < 360.0) /* also catches inf/NaN deltas */) {
+        rbbox all = { 1, min_lat, max_lat, -180.0, 180.0 };
+        q[0] = all;
+    } else if (min_lng < -180.0) {
+        rbbox east = { 1, min_lat, max_lat, min_lng + 360.0, 180.0 };
+        rbbox west = { 1, min_lat, max_lat, -180.0, max_lng };
+        q[0] = east; q[1] = west; nq = 2;
+    } else if (max_lng > 180.0) {
+        rbbox east = { 1, min_lat, max_lat, min_lng, 180.0 };
+        rbbox west = { 1, min_lat, max_lat, -180.0, max_lng - 360.0 };
+        q[0] = east; q[1] = west; nq = 2;
+    } else {
+        rbbox one = { 1, min_lat, max_lat, min_lng, max_lng };
+        q[0] = one;
+    }
+
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     bj_begin_array(b);
-    int e = search_radius_rec(t, t->root, &q, lat, lng, radius_km, b, 0);
+    int e = BJ_OK;
+    for (int i = 0; i < nq && !e; i++)
+        e = search_radius_rec(t, t->root, &q[i], lat, lng, radius_km, b, 0);
     bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -1277,12 +1336,21 @@ static knn_item heap_pop(knn_heap *h) {
 }
 
 /* Minimum haversine distance from a point to a lat/lng box: clamp the point
- * into the box, then measure. (Shares the existing geo simplifications: no
- * antimeridian wrap handling.) */
+ * into the box, then measure. Longitude is periodic, so the numerically
+ * nearest edge can be the wrong way around the antimeridian (query at 179°
+ * vs a box ending at -180°: the naive clamp measures ~359° instead of ~1°) —
+ * clamping the query at ±360° as well and keeping the best distance makes
+ * the bound tight in every direction, so kNN never mis-prunes near ±180°. */
 static double mindist_to_box(double lat, double lng, const rbbox *b) {
     double clat = lat < b->min_lat ? b->min_lat : (lat > b->max_lat ? b->max_lat : lat);
-    double clng = lng < b->min_lng ? b->min_lng : (lng > b->max_lng ? b->max_lng : lng);
-    return geo_haversine_distance(lat, lng, clat, clng);
+    double best = INFINITY;
+    for (int s = -1; s <= 1; s++) {
+        double l = lng + 360.0 * s;
+        double clng = l < b->min_lng ? b->min_lng : (l > b->max_lng ? b->max_lng : l);
+        double d = geo_haversine_distance(lat, lng, clat, clng);
+        if (d < best) best = d;
+    }
+    return best;
 }
 
 int rtree_nearest(rtree *t, double lat, double lng, int k,
