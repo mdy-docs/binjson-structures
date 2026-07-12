@@ -11,12 +11,12 @@
  *     Entries and metadata use the binjson wire format from binjson.c.
  *   - If the file ends in a torn/partial record (e.g. a crash mid-append),
  *     open recovers to the last valid record and truncates the tail.
- *   - Unlike src/textlog.js — which delegates diffing to the `diff` npm package
- *     and hashing to node's crypto — everything lives in C here: SHA-256, the
- *     internal (opaque) prefix/suffix diff used to store DIFF entries, and the
- *     line-based unified diff produced by getDiff. The internal diff format is
- *     private to this implementation (only round-trip correctness is observable,
- *     so files need not interoperate with the JS log).
+ *   - Everything lives in C here: SHA-256, the binary copy/insert delta used to
+ *     store DIFF entries (TL_DIFF_BIN, diff.h — a private format; only
+ *     round-trip correctness is observable), and the line-based unified diff
+ *     produced by getDiff. Legacy DIFF entries written as jsdiff unified-patch
+ *     text (TL_DIFF, e.g. by older builds or the removed JS log) are still
+ *     applied on read.
  *
  * Version arguments are validated here (outside 1..current -> BJ_ERR_RANGE),
  * so a host that forgets its own checks gets a distinct error instead of
@@ -42,9 +42,12 @@ extern "C" {
 
 typedef struct textlog textlog;
 
-/* Entry type bytes (mirror ENTRY_TYPE in textlog.js). */
+/* Entry type bytes. TL_DIFF (jsdiff unified-patch text) is the legacy delta
+ * format, still read from older / JS-written files; new DIFF entries are
+ * written as TL_DIFF_BIN (a compact binary copy/insert delta, diff.h). */
 #define TL_FULL_SNAPSHOT 0x01
 #define TL_DIFF          0x02
+#define TL_DIFF_BIN      0x03
 
 /* Create a fresh empty log (diffs_per_snapshot >= 1) on `io` (expected empty)
  * and write the initial metadata record. Returns NULL on OOM/bad argument. */

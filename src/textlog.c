@@ -8,14 +8,17 @@
  * in-memory index of entry offsets (built by one scan at open) lets version
  * reconstruction read only the snapshot + diff chain it actually needs.
  *
- * The on-disk format is byte-compatible with src/textlog.js, so files
- * interoperate with the JS log:
- *   - SHA-256 is implemented inline (matches crypto.createHash('sha256')).
- *   - DIFF entries store the exact unified-diff patch text that jsdiff's
- *     createPatch would produce (see diff.c), reconstructed via applyPatch.
- *   - getDiff mirrors textlog.js's structuredPatch-based formatting.
- * Entry and metadata records use the same binjson object shapes and key order
- * as the reference, so bytes match field-for-field.
+ * Snapshot and metadata records use the same binjson object shapes, key order,
+ * and inline SHA-256 (matching crypto.createHash('sha256')) as the original,
+ * so those records stay readable by older tools. DIFF entries, however, are
+ * now stored as a compact binary copy/insert delta (TL_DIFF_BIN, see diff.h) —
+ * typically several times smaller than the jsdiff unified-patch text older
+ * versions wrote, and faster to apply. Legacy TL_DIFF entries (unified-patch
+ * text, e.g. from JS-written files) are still applied on read, so old files
+ * keep reconstructing. getDiff is independent of the stored delta format: it
+ * reconstructs both requested versions in full and renders a human-readable
+ * unified diff between them (diff_get_diff), so history is still viewable as
+ * patch text.
  */
 #include "textlog.h"
 #include "bjfile.h"
@@ -327,9 +330,13 @@ static int reconstruct_version(textlog *t, uint64_t version, dbuf *text) {
         if (r.type == TL_FULL_SNAPSHOT) {
             text->len = 0;
             if ((e = dbuf_put(text, r.data, r.datalen))) return e;
-        } else if (r.type == TL_DIFF) {
+        } else if (r.type == TL_DIFF || r.type == TL_DIFF_BIN) {
+            /* TL_DIFF_BIN: new binary copy/insert delta. TL_DIFF: legacy
+             * jsdiff unified-patch text, still applied from older files. */
             uint8_t *nt = NULL; size_t ntl = 0; int applied = 0;
-            int de = diff_apply_patch(text->data, text->len, r.data, r.datalen, &nt, &ntl, &applied);
+            int de = (r.type == TL_DIFF_BIN)
+                ? diff_apply_delta(text->data, text->len, r.data, r.datalen, &nt, &ntl, &applied)
+                : diff_apply_patch(text->data, text->len, r.data, r.datalen, &nt, &ntl, &applied);
             if (de) return diff_err_to_bj(de);
             if (!applied) { free(nt); return BJ_ERR_STATE; }
             text->len = 0;
@@ -383,14 +390,14 @@ static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
             prev_len = prev.len;
         }
         uint8_t *patch = NULL; size_t plen = 0;
-        int de = diff_create_patch("document", prev_data, prev_len, text, text_len, &patch, &plen);
+        int de = diff_create_delta(prev_data, prev_len, text, text_len, &patch, &plen);
         dbuf_free(&prev);
         if (de) { free(patch); return diff_err_to_bj(de); }
-        e = encode_entry(t, TL_DIFF, new_version, hash, 64, patch, (uint32_t)plen, ts_ms);
+        e = encode_entry(t, TL_DIFF_BIN, new_version, hash, 64, patch, (uint32_t)plen, ts_ms);
         free(patch);
         if (e) return e;
         t->diff_count += 1;
-        *out_type = TL_DIFF;
+        *out_type = TL_DIFF_BIN;
     }
 
     t->has_latest = 1;

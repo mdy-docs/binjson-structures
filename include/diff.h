@@ -56,6 +56,29 @@ int diff_apply_patch(const uint8_t *source, size_t srclen,
                      const uint8_t *patch, size_t patchlen,
                      uint8_t **out, size_t *outlen, int *applied);
 
+/*
+ * Binary copy/insert delta (private format; not jsdiff-compatible). Produces a
+ * compact byte-level delta that rebuilds `target` from `source` using COPY
+ * (offset,len) runs from source and INSERT (literal bytes) runs, greedily
+ * matched via a hash index of source K-grams. Typically several times smaller
+ * than a unified-diff patch of the same edit — no context lines, hunk headers,
+ * or per-line prefixes — and faster to apply (memcpy runs, no line scanning).
+ * This is the format TextLog stores for DIFF entries; getDiff still renders a
+ * human-readable unified diff by re-diffing the reconstructed texts.
+ */
+int diff_create_delta(const uint8_t *source, size_t srclen,
+                      const uint8_t *target, size_t targetlen,
+                      uint8_t **out, size_t *outlen);
+
+/*
+ * Apply a diff_create_delta delta to `source`. On success *applied is 1 and
+ * out/outlen hold the rebuilt target; on a malformed or out-of-bounds delta
+ * *applied is 0 and *out is NULL (mirroring diff_apply_patch's "doesn't fit").
+ */
+int diff_apply_delta(const uint8_t *source, size_t srclen,
+                     const uint8_t *delta, size_t deltalen,
+                     uint8_t **out, size_t *outlen, int *applied);
+
 #ifdef __cplusplus
 }
 #endif

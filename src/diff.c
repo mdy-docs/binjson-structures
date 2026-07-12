@@ -916,3 +916,137 @@ applyfail:
     return e;
     #undef RPUSH
 }
+
+/* ---- Binary copy/insert delta (private format) ---------------------- */
+/*
+ * Wire: a sequence of instructions. Each starts with an unsigned LEB128
+ * control word; the low bit is the op (0 = INSERT, 1 = COPY) and the rest is a
+ * length. INSERT is followed by `length` literal bytes; COPY is followed by a
+ * LEB128 absolute source offset. Rebuilding walks the instructions, appending
+ * literals or copying source[offset .. offset+length). Lengths/offsets are
+ * bounds-checked on apply, so a corrupt delta fails cleanly (applied = 0).
+ */
+
+#define DELTA_K 16   /* min match length; also the hash-gram width */
+
+static int sb_putvar(sb *b, uint64_t v) {
+    uint8_t tmp[10]; int n = 0;
+    do { uint8_t byte = (uint8_t)(v & 0x7f); v >>= 7; if (v) byte |= 0x80; tmp[n++] = byte; } while (v);
+    return sb_putn(b, tmp, (size_t)n);
+}
+
+/* Read a LEB128 varint in [p,end); returns bytes consumed, or 0 if truncated
+ * or malformed (> 64 bits). */
+static int read_var(const uint8_t *p, const uint8_t *end, uint64_t *out) {
+    uint64_t v = 0; int shift = 0; const uint8_t *s = p;
+    while (p < end) {
+        uint8_t byte = *p++;
+        v |= (uint64_t)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) { *out = v; return (int)(p - s); }
+        shift += 7;
+        if (shift >= 64) return 0;   /* overrun: malformed */
+    }
+    return 0;   /* truncated */
+}
+
+static uint64_t delta_hash(const uint8_t *p) {
+    uint64_t h = 1469598103934665603ULL;   /* FNV-1a over DELTA_K bytes */
+    for (int i = 0; i < DELTA_K; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static int emit_insert(sb *b, const uint8_t *p, size_t n) {
+    int e = sb_putvar(b, (uint64_t)n << 1);   /* op bit 0 */
+    if (e) return e;
+    return sb_putn(b, p, n);
+}
+static int emit_copy(sb *b, size_t off, size_t len) {
+    int e = sb_putvar(b, ((uint64_t)len << 1) | 1);   /* op bit 1 */
+    if (e) return e;
+    return sb_putvar(b, (uint64_t)off);
+}
+
+int diff_create_delta(const uint8_t *src, size_t srclen,
+                      const uint8_t *tgt, size_t tgtlen,
+                      uint8_t **out, size_t *outlen) {
+    sb b; memset(&b, 0, sizeof(b));
+
+    /* Hash index of source K-grams -> last start position (+1; 0 = empty).
+     * Skipped for tiny/huge sources; the target is then one INSERT. */
+    uint32_t *table = NULL; uint64_t mask = 0;
+    if (srclen >= (size_t)DELTA_K && srclen <= 0xffffffffULL) {
+        uint64_t cap = 16;
+        while (cap < srclen * 2) cap <<= 1;
+        table = (uint32_t *)calloc((size_t)cap, sizeof(uint32_t));
+        if (!table) return DIFF_ERR_OOM;
+        mask = cap - 1;
+        for (size_t i = 0; i + DELTA_K <= srclen; i++)
+            table[delta_hash(src + i) & mask] = (uint32_t)(i + 1);
+    }
+
+    int e = DIFF_OK;
+    size_t j = 0, ins = 0;   /* pending insert = tgt[ins .. j) */
+    while (table && j + (size_t)DELTA_K <= tgtlen) {
+        uint32_t pe = table[delta_hash(tgt + j) & mask];
+        size_t sp = pe ? (size_t)pe - 1 : 0;
+        if (pe && sp + (size_t)DELTA_K <= srclen &&
+            memcmp(src + sp, tgt + j, (size_t)DELTA_K) == 0) {
+            size_t mlen = (size_t)DELTA_K;
+            while (sp + mlen < srclen && j + mlen < tgtlen && src[sp + mlen] == tgt[j + mlen]) mlen++;
+            /* absorb pending-insert bytes the match also covers backwards */
+            while (sp > 0 && j > ins && src[sp - 1] == tgt[j - 1]) { sp--; j--; mlen++; }
+            if (j > ins && (e = emit_insert(&b, tgt + ins, j - ins))) goto done;
+            if ((e = emit_copy(&b, sp, mlen))) goto done;
+            j += mlen; ins = j;
+        } else {
+            j++;
+        }
+    }
+    if (tgtlen > ins && (e = emit_insert(&b, tgt + ins, tgtlen - ins))) goto done;
+
+done:
+    free(table);
+    if (e) { free(b.p); return e; }
+    *out = b.p ? b.p : (uint8_t *)calloc(1, 1);
+    if (!*out) return DIFF_ERR_OOM;
+    *outlen = b.len;
+    return DIFF_OK;
+}
+
+int diff_apply_delta(const uint8_t *src, size_t srclen,
+                     const uint8_t *delta, size_t deltalen,
+                     uint8_t **out, size_t *outlen, int *applied) {
+    *applied = 0;
+    sb b; memset(&b, 0, sizeof(b));
+    const uint8_t *p = delta, *end = delta + deltalen;
+    int e = DIFF_OK;
+    while (p < end) {
+        uint64_t ctrl; int n = read_var(p, end, &ctrl);
+        if (!n) goto bad;
+        p += n;
+        uint64_t len = ctrl >> 1;
+        if ((ctrl & 1) == 0) {   /* INSERT */
+            if ((uint64_t)(end - p) < len) goto bad;
+            if ((e = sb_putn(&b, p, (size_t)len))) goto err;
+            p += len;
+        } else {                 /* COPY */
+            uint64_t off; n = read_var(p, end, &off);
+            if (!n) goto bad;
+            p += n;
+            if (off > srclen || len > srclen - off) goto bad;   /* off+len <= srclen */
+            if ((e = sb_putn(&b, src + off, (size_t)len))) goto err;
+        }
+    }
+    *out = b.p ? b.p : (uint8_t *)calloc(1, 1);
+    if (!*out) { e = DIFF_ERR_OOM; goto err; }
+    *outlen = b.len;
+    *applied = 1;
+    return DIFF_OK;
+
+bad:
+    free(b.p);
+    return DIFF_OK;   /* applied stays 0 — malformed delta, like a patch that doesn't fit */
+err:
+    free(b.p);
+    return e;
+}
