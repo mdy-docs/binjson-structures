@@ -61,8 +61,6 @@ typedef struct {
     bpt_blob  *values;      /* n_values (== n_keys on leaves)              */
     int        n_children;
     uint64_t  *children;    /* n_children (pointer offsets)                */
-    int        has_next;
-    uint64_t   next;
     uint8_t   *buf;         /* parsed nodes: one owned copy of the record
                                that keys/values point into, making parsing
                                O(1) allocations. NULL on built nodes, whose
@@ -194,9 +192,9 @@ static void node_free(bpt_node *n) {
 
 /* Build a leaf/internal node by deep-copying the supplied arrays. */
 static int node_build_leaf(bpt_node *out, uint64_t id, const bpt_key *keys,
-                           const bpt_blob *vals, int n, int has_next, uint64_t next) {
+                           const bpt_blob *vals, int n) {
     node_init(out);
-    out->id = id; out->is_leaf = 1; out->has_next = has_next; out->next = next;
+    out->id = id; out->is_leaf = 1;
     if (n) {
         out->keys = (bpt_key *)malloc((size_t)n * sizeof(bpt_key));
         out->values = (bpt_blob *)malloc((size_t)n * sizeof(bpt_blob));
@@ -348,17 +346,11 @@ static int parse_node(bpt *t, uint64_t offset, bpt_node *out) {
                 if ((e = read_pointer(&c, &out->children[j]))) { node_free(out); return e; }
             }
             out->n_children = (int)n;
-        } else if (name_eq(kn, klen, "next")) {
-            uint8_t nt;
-            if (take_type(&c, &nt)) { node_free(out); return BJ_ERR_EOF; }
-            if (nt == BJ_TYPE_NULL) {
-                out->has_next = 0;
-            } else if (nt == BJ_TYPE_POINTER) {
-                if (cur_need(&c, 8)) { node_free(out); return BJ_ERR_EOF; }
-                out->next = rdu64(c.d + c.pos);
-                c.pos += 8; out->has_next = 1;
-            } else { node_free(out); return BJ_ERR_UNKNOWN_TYPE; }
         } else {
+            /* Unknown key — including the legacy leaf "next" pointer, which is
+             * no longer written or used: it is dead weight (inserts wrote it
+             * null, deletes left a stale sibling pointer, nothing followed it).
+             * skip_value consumes whatever a legacy file stored there. */
             e = skip_value(&c);
         }
         if (e) { node_free(out); return e; }
@@ -462,9 +454,6 @@ static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, uint64_t *off
     bj_begin_array(b);
     for (int i = 0; i < nd->n_children; i++) bj_put_pointer(b, nd->children[i]);
     bj_end_array(b);
-    bj_put_key(b, (const uint8_t *)"next", 4);
-    if (nd->has_next) bj_put_pointer(b, nd->next);
-    else bj_put_null(b);
     bj_end_object(b);
 
     int e = bj_builder_error(b);
@@ -594,7 +583,7 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
             e = store_value(t, &t->f, val, vlen, &nb);
             if (e) { free(wv); node_free(&nd); return e; }
             wv[idx] = nb;
-            e = node_build_leaf(&out->newn, nd.id, nd.keys, wv, nd.n_keys, 0, 0);
+            e = node_build_leaf(&out->newn, nd.id, nd.keys, wv, nd.n_keys);
             blob_free(&nb);
             free(wv);
             out->is_split = 0;
@@ -616,12 +605,12 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
         for (int i = insertIdx; i < nd.n_keys; i++) { wk[i + 1] = nd.keys[i]; wv[i + 1] = nd.values[i]; }
 
         if (nlen < t->order) {
-            e = node_build_leaf(&out->newn, nd.id, wk, wv, nlen, 0, 0);
+            e = node_build_leaf(&out->newn, nd.id, wk, wv, nlen);
             out->is_split = 0;
         } else {
             int mid = (nlen + 1) / 2;   /* ceil(nlen/2) */
-            e = node_build_leaf(&out->left, nd.id, wk, wv, mid, 0, 0);
-            if (!e) e = node_build_leaf(&out->right, t->next_id++, wk + mid, wv + mid, nlen - mid, 0, 0);
+            e = node_build_leaf(&out->left, nd.id, wk, wv, mid);
+            if (!e) e = node_build_leaf(&out->right, t->next_id++, wk + mid, wv + mid, nlen - mid);
             if (!e) e = key_copy(&out->split_key, &wk[mid]);
             out->is_split = 1;
         }
@@ -792,18 +781,17 @@ static int rebalance_child(bpt *t, const bpt_node *par, int i,
     bpt_key promoted = {0};       /* owned separator copy when split */
     bpt_node nn;
     if (!split) {
-        if (leaf) e = node_build_leaf(&nn, L->id, wk, wv, nk, R->has_next, R->next);
+        if (leaf) e = node_build_leaf(&nn, L->id, wk, wv, nk);
         else      e = node_build_internal(&nn, L->id, wk, nk, wc, nc);
         if (!e) e = save_node(t, &nn, &lp);
         node_free(&nn);
     } else if (leaf) {
         int mid = (nk + 1) / 2;   /* ceil(nk/2), as in insert */
-        e = node_build_leaf(&nn, L->id, wk, wv, mid, 0, 0);
+        e = node_build_leaf(&nn, L->id, wk, wv, mid);
         if (!e) e = save_node(t, &nn, &lp);
         node_free(&nn);
         if (!e) {
-            e = node_build_leaf(&nn, R->id, wk + mid, wv + mid, nk - mid,
-                                R->has_next, R->next);
+            e = node_build_leaf(&nn, R->id, wk + mid, wv + mid, nk - mid);
             if (!e) e = save_node(t, &nn, &rp);
             node_free(&nn);
         }
@@ -876,7 +864,7 @@ static int del_node(bpt *t, uint64_t ptr, const bpt_key *key, del_res *out,
             if (i == idx) continue;
             wk[k] = nd.keys[i]; wv[k] = nd.values[i]; k++;
         }
-        e = node_build_leaf(&out->node, nd.id, wk, wv, nlen, nd.has_next, nd.next);
+        e = node_build_leaf(&out->node, nd.id, wk, wv, nlen);
         free(wk); free(wv);
         out->found = 1;
         node_free(&nd);
@@ -1531,7 +1519,7 @@ static int init_empty(bpt *t) {
     int e = bjfile_append_header(&t->f, t->bld, "bplustree");
     if (e) return e;
     bpt_node root;
-    if ((e = node_build_leaf(&root, 0, NULL, NULL, 0, 0, 0))) {
+    if ((e = node_build_leaf(&root, 0, NULL, NULL, 0))) {
         node_free(&root);
         return e;
     }
