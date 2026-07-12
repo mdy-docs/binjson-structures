@@ -28,6 +28,26 @@
  * forever. Vastly deeper than any real tree (height is O(log n)). */
 #define BPT_MAX_DEPTH 128
 
+/*
+ * Values larger than this are stored out-of-line: appended to the file once
+ * as their own record, with the leaf holding a small marker instead of the
+ * raw bytes. Every leaf rewrite (any insert/delete touching that leaf)
+ * otherwise re-copies every sibling value on disk — order 32 with 1 KB
+ * values costs ~32 KB of unchanged bytes per insert. 256 bytes keeps
+ * ordinary small values (numbers, short strings, small documents) inline,
+ * where the marker's own overhead wouldn't pay for itself.
+ */
+#define BPT_OOL_THRESHOLD 256
+
+/* Out-of-line marker key: { "\0ool": Pointer(offset) }. The leading NUL
+ * makes collision with a caller's real value astronomically unlikely (no
+ * ordinary JS object key contains one) without spending a new wire type —
+ * the same reserved-key convention textindex uses for its stats key. Marker
+ * records are always small (well under the threshold above), so a real
+ * value is never mistaken for one by size alone. */
+static const uint8_t BPT_OOL_KEY[] = { 0x00, 'o', 'o', 'l' };
+#define BPT_OOL_KEY_LEN 4
+
 /* ---- Values, keys, nodes -------------------------------------------- */
 
 typedef struct { uint8_t *bytes; uint32_t len; } bpt_blob;
@@ -360,6 +380,69 @@ static int emit_key(bj_builder *b, const bpt_key *k) {
     return bj_put_float(b, k->num);
 }
 
+/* ---- Out-of-line values (see BPT_OOL_THRESHOLD above) ---------------- */
+
+/* True if `blob` is an out-of-line marker; writes the target offset to
+ * *off. A real value only ever matches this by deliberately constructing
+ * the exact reserved shape (see BPT_OOL_KEY). */
+static int blob_is_ool(const bpt_blob *blob, uint64_t *off) {
+    cur c = { blob->bytes, blob->len, 0 };
+    uint32_t count;
+    if (object_begin(&c, &count) || count != 1) return 0;
+    const uint8_t *kn; uint32_t klen;
+    if (take_key(&c, &kn, &klen)) return 0;
+    if (klen != BPT_OOL_KEY_LEN || memcmp(kn, BPT_OOL_KEY, BPT_OOL_KEY_LEN) != 0) return 0;
+    return read_pointer(&c, off) == BJ_OK;
+}
+
+/*
+ * Resolve a leaf value for output. An inline blob is returned as a view
+ * (no copy, as before); an out-of-line marker is dereferenced through
+ * `src`, returning a view into its transient read buffer — valid only
+ * until the next read on `src`, so the caller must consume it (copy into
+ * an output buffer, or bj_put_raw into a builder) before triggering
+ * another one.
+ */
+static int resolve_value(bjfile *src, const bpt_blob *blob,
+                         const uint8_t **out_ptr, size_t *out_len) {
+    uint64_t off;
+    if (!blob_is_ool(blob, &off)) {
+        *out_ptr = blob->bytes; *out_len = blob->len;
+        return BJ_OK;
+    }
+    return bjfile_read_record(src, off, out_ptr, out_len);
+}
+
+/*
+ * Store a value for a leaf entry, applying the out-of-line threshold: small
+ * values are copied inline as an owned blob (unchanged behavior); values
+ * over BPT_OOL_THRESHOLD are appended to `dst` once and the leaf holds a
+ * small marker instead — the whole fix for the write-amplification problem,
+ * since every later leaf rewrite that merely carries this entry along now
+ * copies the marker, not the value. `dst` is the live file for a normal add,
+ * or a compaction's destination file. Returns an owned blob (a copy of the
+ * value, or the built marker) the caller must blob_free after use.
+ */
+static int store_value(bpt *t, bjfile *dst, const uint8_t *val, uint32_t vlen,
+                       bpt_blob *out) {
+    if (vlen <= BPT_OOL_THRESHOLD) return blob_copy(out, val, vlen);
+    uint64_t off;
+    int e = file_append_to(dst, val, vlen, &off);
+    if (e) return e;
+    bj_builder *b = t->bld;
+    bj_builder_reset(b);
+    bj_begin_object(b);
+    bj_put_key(b, BPT_OOL_KEY, BPT_OOL_KEY_LEN);
+    bj_put_pointer(b, off);
+    bj_end_object(b);
+    e = bj_builder_error(b);
+    if (e) return e;
+    size_t mlen;
+    const uint8_t *m = bj_builder_data(b, &mlen);
+    if (!m) return BJ_ERR_STATE;
+    return blob_copy(out, m, mlen);
+}
+
 /* Encode `nd` and append it to `dst`; return its offset via *off. */
 static int encode_node_to(bpt *t, const bpt_node *nd, bjfile *dst, uint64_t *off) {
     bj_builder *b = t->bld;
@@ -507,9 +590,12 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
             bpt_blob *wv = (bpt_blob *)malloc((size_t)nd.n_keys * sizeof(bpt_blob));
             if (!wv) { node_free(&nd); return BJ_ERR_OOM; }
             for (int i = 0; i < nd.n_keys; i++) wv[i] = nd.values[i];
-            bpt_blob nb = { (uint8_t *)val, vlen };
+            bpt_blob nb;
+            e = store_value(t, &t->f, val, vlen, &nb);
+            if (e) { free(wv); node_free(&nd); return e; }
             wv[idx] = nb;
             e = node_build_leaf(&out->newn, nd.id, nd.keys, wv, nd.n_keys, 0, 0);
+            blob_free(&nb);
             free(wv);
             out->is_split = 0;
             out->updated = 1;
@@ -523,7 +609,10 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
         if (!wk || !wv) { free(wk); free(wv); node_free(&nd); return BJ_ERR_OOM; }
         for (int i = 0; i < insertIdx; i++) { wk[i] = nd.keys[i]; wv[i] = nd.values[i]; }
         wk[insertIdx] = *key;
-        { bpt_blob nb = { (uint8_t *)val, vlen }; wv[insertIdx] = nb; }
+        bpt_blob nb;
+        e = store_value(t, &t->f, val, vlen, &nb);
+        if (e) { free(wk); free(wv); node_free(&nd); return e; }
+        wv[insertIdx] = nb;
         for (int i = insertIdx; i < nd.n_keys; i++) { wk[i + 1] = nd.keys[i]; wv[i + 1] = nd.values[i]; }
 
         if (nlen < t->order) {
@@ -536,6 +625,7 @@ static int add_node(bpt *t, uint64_t ptr, const bpt_key *key,
             if (!e) e = key_copy(&out->split_key, &wk[mid]);
             out->is_split = 1;
         }
+        blob_free(&nb);
         free(wk); free(wv);
         node_free(&nd);
         return e;
@@ -880,9 +970,11 @@ int bpt_search(bpt *t, const bpt_key *key, int *found,
         if (nd.is_leaf) {
             int fi = key_find(nd.keys, nd.n_keys, key);
             if (fi >= 0) {
-                /* One copy: straight from the node's record bytes into the
-                 * output buffer (the value was itself a view, not a copy). */
-                e = set_out(t, nd.values[fi].bytes, nd.values[fi].len);
+                /* One copy: straight from the resolved bytes (inline view,
+                 * or the out-of-line record) into the output buffer. */
+                const uint8_t *vp; size_t vl;
+                e = resolve_value(&t->f, &nd.values[fi], &vp, &vl);
+                if (!e) e = set_out(t, vp, vl);
                 node_free(&nd);
                 if (e) return e;
                 *found = 1; *out_ptr = t->out.data; *out_len = t->out.len;
@@ -915,9 +1007,11 @@ static int collect(bpt *t, uint64_t ptr, bj_builder *b, int filt,
     if (nd.is_leaf) {
         for (int i = 0; i < nd.n_keys; i++) {
             if (filt && (key_cmp(&nd.keys[i], mn) < 0 || key_cmp(&nd.keys[i], mx) > 0)) continue;
+            const uint8_t *vp; size_t vl;
+            if ((e = resolve_value(&t->f, &nd.values[i], &vp, &vl))) { node_free(&nd); return e; }
             bj_begin_object(b);
             bj_put_key(b, (const uint8_t *)"key", 3);   emit_key(b, &nd.keys[i]);
-            bj_put_key(b, (const uint8_t *)"value", 5); bj_put_raw(b, nd.values[i].bytes, nd.values[i].len);
+            bj_put_key(b, (const uint8_t *)"value", 5); bj_put_raw(b, vp, vl);
             bj_end_object(b);
         }
     } else {
@@ -1049,9 +1143,11 @@ int bpt_cursor_next(bpt_cursor *c, bpt_key *key,
         if (c->has_leaf && c->leaf_pos < c->leaf.n_keys) {
             bpt_key *k = &c->leaf.keys[c->leaf_pos];
             if (c->has_max && key_cmp(k, &c->max) > 0) break;   /* past max */
+            /* Resolved value is valid only until the next read on this
+             * tree — callers (bpt_cursor_next_batch) consume it immediately. */
+            int e = resolve_value(&c->t->f, &c->leaf.values[c->leaf_pos], val, val_len);
+            if (e) { c->done = 1; cursor_release(c); return e; }
             *key = *k;
-            *val = c->leaf.values[c->leaf_pos].bytes;
-            *val_len = c->leaf.values[c->leaf_pos].len;
             c->leaf_pos++;
             return 1;
         }
@@ -1169,6 +1265,12 @@ static int verify_node(verify_state *vs, uint64_t ptr, const bpt_key *lower,
         if (vs->leaf_depth < 0) vs->leaf_depth = depth;
         else if (vs->leaf_depth != depth) e = BJ_ERR_VERIFY;   /* uneven height */
         vs->entries += nd.n_keys;
+        /* Out-of-line value pointers are append-only writes too: same
+         * before-the-node ordering check as child pointers. */
+        for (int i = 0; !e && i < nd.n_values; i++) {
+            uint64_t off;
+            if (blob_is_ool(&nd.values[i], &off) && off >= ptr) e = BJ_ERR_VERIFY;
+        }
     } else if (!e) {
         for (int i = 0; i <= nd.n_keys && !e; i++) {
             /* Append-only writers emit children before the node that points
@@ -1309,9 +1411,10 @@ static int bl_add_child(bulk_loader *bl, int L, int has_sep, bpt_key *sep, uint6
     return BJ_OK;
 }
 
-/* Stream one entry (key ordering is the caller's responsibility). The
- * loader takes its own copies: callers pass views into a parsed node that
- * dies before the accumulating level node fills. */
+/* Stream one entry (key ordering is the caller's responsibility, and
+ * `val` must be the entry's real bytes — resolved, not an out-of-line
+ * marker). The loader takes its own copies: callers pass views into a
+ * parsed node that dies before the accumulating level node fills. */
 static int bl_add_entry(bulk_loader *bl, const bpt_key *key, const bpt_blob *val) {
     int e = bl_ensure_level(bl, 0);
     if (e) return e;
@@ -1332,7 +1435,10 @@ static int bl_add_entry(bulk_loader *bl, const bpt_key *key, const bpt_blob *val
     }
     e = key_copy(&lev->keys[lev->n_keys], key);
     if (e) return e;
-    e = blob_copy(&lev->vals[lev->n_vals], val->bytes, val->len);
+    /* Re-applies the out-of-line threshold against the destination file:
+     * self-healing regardless of how the source stored the value (inline,
+     * already out-of-line, or from before the threshold existed). */
+    e = store_value(bl->t, bl->dst, val->bytes, val->len, &lev->vals[lev->n_vals]);
     if (e) { key_free(&lev->keys[lev->n_keys]); return e; }
     lev->n_keys++;
     lev->n_vals++;
@@ -1382,8 +1488,14 @@ static int compact_walk(bpt *t, uint64_t ptr, bulk_loader *bl, int depth) {
     int e = parse_node(t, ptr, &nd);
     if (e) return e;
     if (nd.is_leaf) {
-        for (int i = 0; i < nd.n_keys && !e; i++)
-            e = bl_add_entry(bl, &nd.keys[i], &nd.values[i]);
+        for (int i = 0; i < nd.n_keys && !e; i++) {
+            const uint8_t *vp; size_t vl;
+            e = resolve_value(&t->f, &nd.values[i], &vp, &vl);
+            if (!e) {
+                bpt_blob resolved = { (uint8_t *)vp, (uint32_t)vl };
+                e = bl_add_entry(bl, &nd.keys[i], &resolved);
+            }
+        }
     } else {
         for (int i = 0; i < nd.n_children && !e; i++)
             e = compact_walk(t, nd.children[i], bl, depth + 1);

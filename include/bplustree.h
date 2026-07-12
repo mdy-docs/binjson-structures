@@ -10,8 +10,14 @@
  *     fresh metadata with a single write, exactly like src/bplustree.js.
  *   - Nodes and metadata use the exact binjson wire format of bplustree.js, so
  *     files stay byte-compatible (bin/bplustree-decode.js can read them).
- *   - The tree compares only *keys* (number or string); *values* are opaque,
- *     carried as raw pre-encoded binjson blobs and never interpreted here.
+ *   - The tree compares only *keys* (number or string); *values* are opaque
+ *     raw pre-encoded binjson blobs. Values over ~256 bytes are stored
+ *     out-of-line — appended once as their own record, with a small marker
+ *     left in the leaf — so a leaf rewrite (any insert/delete that merely
+ *     carries a large value along) copies the marker rather than the value;
+ *     every read API resolves this transparently and returns the real
+ *     bytes. Invisible to callers of this API; only visible at the raw
+ *     record level (e.g. reading a leaf node directly).
  *
  * All operations return BJ_OK (0) or a negative BJ_ERR_* code from binjson.h.
  */
@@ -90,12 +96,13 @@ int bpt_height(bpt *t, int *out_height);
  * keys (equal-keys-route-right: a child left of separator s holds keys < s,
  * right of it keys >= s), node sizes within capacity, every child offset
  * strictly below the node that points at it (append-only writers emit
- * children before parents, so this also rules out pointer cycles), all
- * leaves at one depth, and the leaf entry total equal to the metadata size.
- * Deliberately does NOT check min-fill or forbid zero-key internal nodes:
- * files written by the JS reference (which never rebalances deletes) are
- * legitimately under-filled, and the compaction bulk loader's rightmost
- * spine legitimately emits one-child internals at level tails.
+ * children before parents, so this also rules out pointer cycles), the same
+ * before-the-node check for out-of-line value pointers, all leaves at one
+ * depth, and the leaf entry total equal to the metadata size. Deliberately
+ * does NOT check min-fill or forbid zero-key internal nodes: files written
+ * by the JS reference (which never rebalances deletes) are legitimately
+ * under-filled, and the compaction bulk loader's rightmost spine
+ * legitimately emits one-child internals at level tails.
  *
  * Returns BJ_OK, BJ_ERR_VERIFY on a violated invariant, or an I/O or parse
  * error. Reads every node (O(N)); works on snapshots.
