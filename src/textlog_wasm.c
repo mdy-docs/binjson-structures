@@ -27,6 +27,13 @@ EMSCRIPTEN_KEEPALIVE textlog *tlw_create(int fd, int diffs_per_snapshot) {
     bj_io io = bjio_host(fd);
     return textlog_create(&io, diffs_per_snapshot);
 }
+/* Create a tile continuing a previous one's numbering (base_version crosses as
+ * a double, lossless to 2^53). base_version 0 == tlw_create. */
+EMSCRIPTEN_KEEPALIVE textlog *tlw_create_at(int fd, int diffs_per_snapshot,
+                                            double base_version) {
+    bj_io io = bjio_host(fd);
+    return textlog_create_at(&io, diffs_per_snapshot, (uint64_t)base_version);
+}
 EMSCRIPTEN_KEEPALIVE textlog *tlw_open(int fd) {
     bj_io io = bjio_host(fd);
     return textlog_open(&io);
@@ -56,6 +63,7 @@ EMSCRIPTEN_KEEPALIVE int tlw_get_diff(textlog *t, double from_v, double to_v) {
 }
 
 EMSCRIPTEN_KEEPALIVE double tlw_version(textlog *t)            { return (double)textlog_version(t); }
+EMSCRIPTEN_KEEPALIVE double tlw_base_version(textlog *t)       { return (double)textlog_base_version(t); }
 EMSCRIPTEN_KEEPALIVE int    tlw_diffs_per_snapshot(textlog *t) { return textlog_diffs_per_snapshot(t); }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_out_ptr(textlog *t) {

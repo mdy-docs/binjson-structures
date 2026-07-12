@@ -49,6 +49,16 @@ typedef struct textlog textlog;
 /* Create a fresh empty log (diffs_per_snapshot >= 1) on `io` (expected empty)
  * and write the initial metadata record. Returns NULL on OOM/bad argument. */
 textlog *textlog_create(const bj_io *io, int diffs_per_snapshot);
+/*
+ * Create a fresh log tile whose global version numbering continues after an
+ * earlier tile: it owns versions (base_version, ...], so the first
+ * textlog_add_version produces base_version + 1 (a full snapshot, so the tile
+ * reconstructs independently of any other tile). base_version == 0 is
+ * identical to textlog_create. The host routes each global version to the tile
+ * that owns it (see textlog_base_version) and decides when to roll to a new
+ * tile — the log format itself carries only each tile's base. */
+textlog *textlog_create_at(const bj_io *io, int diffs_per_snapshot,
+                           uint64_t base_version);
 /* Open an existing log from `io`, scanning it once to index entry offsets.
  * Returns NULL on OOM or if no valid metadata record is found. */
 textlog *textlog_open(const bj_io *io);
@@ -57,6 +67,9 @@ void textlog_free(textlog *t);
 
 /* Accessors (mirror the JS metadata fields). */
 uint64_t       textlog_version(const textlog *t);
+/* Highest global version owned by an earlier tile (0 for a standalone log): a
+ * tile serves versions in (base_version, version]. */
+uint64_t       textlog_base_version(const textlog *t);
 int            textlog_diffs_per_snapshot(const textlog *t);
 /* The last read output (getVersion / getVersionHash / getDiff); *len set. */
 const uint8_t *textlog_out(const textlog *t, size_t *len);

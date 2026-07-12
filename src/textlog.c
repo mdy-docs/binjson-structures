@@ -141,6 +141,7 @@ typedef struct {
     int has_latest; uint64_t latest;
     int64_t diff_count;
     int diffs_per_snapshot;
+    uint64_t base_version;   /* 0 (absent) for a standalone / first tile */
 } trec;
 
 /* Parse the record bytes (rec, len) into *r. The string fields point into
@@ -176,6 +177,8 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
         } else if (name_eq(kn, klen, "diffsPerSnapshot")) {
             if ((e = read_int31(&c, &r->diffs_per_snapshot))) return e;
             r->is_metadata = 1;
+        } else if (name_eq(kn, klen, "baseVersion")) {
+            if ((e = read_u64(&c, &r->base_version))) return e;
         } else {
             if ((e = skip_value(&c))) return e;
         }
@@ -199,6 +202,8 @@ struct textlog {
     dbuf        out;             /* last read output                    */
     bj_builder *bld;             /* reused for entry/metadata encoding  */
     uint64_t    version;
+    uint64_t    base_version;    /* versions <= base live in earlier tiles;
+                                    0 for a standalone / first-tile log       */
     int64_t     diff_count;
     int         diffs_per_snapshot;
     int         has_snapshot; uint64_t snapshot_ptr;
@@ -267,6 +272,12 @@ static int save_metadata(textlog *t) {
     bj_put_int(b, t->diff_count);
     bj_put_key(b, (const uint8_t *)"diffsPerSnapshot", 16);
     bj_put_int(b, t->diffs_per_snapshot);
+    /* Written only for tiles beyond the first, so a standalone log's metadata
+     * stays byte-identical to the pre-tiling format (and to JS-written logs). */
+    if (t->base_version) {
+        bj_put_key(b, (const uint8_t *)"baseVersion", 11);
+        bj_put_int(b, (int64_t)t->base_version);
+    }
     bj_end_object(b);
     int e = bj_builder_error(b);
     if (e) return e;
@@ -425,7 +436,7 @@ int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
  * a second embedder that forgets to validate gets BJ_ERR_RANGE, not the
  * empty/latest text the raw reconstruction would silently produce. */
 static int version_in_range(const textlog *t, uint64_t version) {
-    return version >= 1 && version <= t->version;
+    return version > t->base_version && version <= t->version;
 }
 
 int textlog_get_version(textlog *t, uint64_t version,
@@ -498,14 +509,20 @@ int textlog_get_diff(textlog *t, uint64_t from_version, uint64_t to_version,
 
 /* ---- Lifecycle & accessors ------------------------------------------ */
 
-textlog *textlog_create(const bj_io *io, int diffs_per_snapshot) {
+textlog *textlog_create_at(const bj_io *io, int diffs_per_snapshot,
+                           uint64_t base_version) {
     if (diffs_per_snapshot < 1) return NULL;
     textlog *t = (textlog *)calloc(1, sizeof(textlog));
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
     bjfile_init(&t->f, io);
-    t->version = 0;
+    /* A fresh tile owns global versions (base_version, ...]: the first
+     * addVersion produces base_version + 1, and because has_latest is 0 it is
+     * forced to be a full snapshot — so the tile is self-contained without
+     * repeating any version from the previous tile. */
+    t->version = base_version;
+    t->base_version = base_version;
     t->diff_count = 0;
     t->diffs_per_snapshot = diffs_per_snapshot;
     t->has_snapshot = 0;
@@ -516,6 +533,10 @@ textlog *textlog_create(const bj_io *io, int diffs_per_snapshot) {
         return NULL;
     }
     return t;
+}
+
+textlog *textlog_create(const bj_io *io, int diffs_per_snapshot) {
+    return textlog_create_at(io, diffs_per_snapshot, 0);
 }
 
 /*
@@ -581,7 +602,8 @@ textlog *textlog_open(const bj_io *io) {
     if (!adopt ||
         (adopt->has_snap && adopt->snap >= good) ||
         (adopt->has_latest && adopt->latest >= good) ||
-        adopt->diff_count < 0) {
+        adopt->diff_count < 0 ||
+        adopt->base_version > adopt->version) {   /* base == version: empty tile */
         textlog_free(t);
         return NULL;
     }
@@ -590,6 +612,7 @@ textlog *textlog_open(const bj_io *io) {
     while (t->n_ents && t->ents[t->n_ents - 1].off >= good) t->n_ents--;
 
     t->version = adopt->version;
+    t->base_version = adopt->base_version;   /* 0 when the field is absent */
     t->has_snapshot = adopt->has_snap; t->snapshot_ptr = adopt->snap;
     t->has_latest = adopt->has_latest; t->latest_ptr = adopt->latest;
     t->diff_count = adopt->diff_count;
@@ -610,5 +633,6 @@ void textlog_free(textlog *t) {
 }
 
 uint64_t       textlog_version(const textlog *t)            { return t->version; }
+uint64_t       textlog_base_version(const textlog *t)       { return t->base_version; }
 int            textlog_diffs_per_snapshot(const textlog *t) { return t->diffs_per_snapshot; }
 const uint8_t *textlog_out(const textlog *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }
