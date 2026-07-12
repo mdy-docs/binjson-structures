@@ -204,6 +204,12 @@ struct textlog {
     int         has_snapshot; uint64_t snapshot_ptr;
     int         has_latest;   uint64_t latest_ptr;
     tl_ent     *ents; int n_ents, cap_ents;   /* entry index            */
+    /* Cache of the current version's full text: addVersion used to
+     * re-derive (snapshot + diff chain reads) the very text it produced
+     * on the previous call just to diff against it. Purely an
+     * optimization — dropped on OOM, rebuilt on demand. */
+    dbuf        latest_text;
+    int         has_latest_text;
 };
 
 static int ents_reserve(textlog *t, int need) {
@@ -283,6 +289,12 @@ static int diff_err_to_bj(int e) {
  * latest snapshot at or before `version` and apply each subsequent DIFF entry's
  * patch in order, exactly like textlog.js getVersion. The entry index makes
  * this read only the snapshot + diff chain, not the whole file.
+ *
+ * The result is verified against the requested entry's stored SHA-256 (every
+ * writer stores one per entry), so diff-chain corruption is caught the moment
+ * a version is read instead of surfacing as silently wrong text —
+ * BJ_ERR_VERIFY. Entries without a 64-hex hash (foreign/hostile files; no
+ * legitimate writer omits it) are accepted unverified.
  */
 static int reconstruct_version(textlog *t, uint64_t version, dbuf *text) {
     text->len = 0;
@@ -293,11 +305,12 @@ static int reconstruct_version(textlog *t, uint64_t version, dbuf *text) {
     while (start >= 0 && t->ents[start].type != TL_FULL_SNAPSHOT) start--;
     if (start < 0) return BJ_ERR_STATE;   /* diff chain without a snapshot */
 
+    trec r;
+    memset(&r, 0, sizeof(r));
     for (int i = start; i <= hi; i++) {
         const uint8_t *rec; size_t rec_len;
         int e = bjfile_read_record(&t->f, t->ents[i].off, &rec, &rec_len);
         if (e) return e;
-        trec r;
         e = parse_record(rec, rec_len, &r);
         if (e) return e;
         if (r.type == TL_FULL_SNAPSHOT) {
@@ -313,6 +326,13 @@ static int reconstruct_version(textlog *t, uint64_t version, dbuf *text) {
             free(nt);
             if (e) return e;
         }
+    }
+    /* r still holds entry `hi` — the version we just rebuilt — and its hash
+     * view stays valid (no reads happen after that record's). */
+    if (r.hashlen == 64) {
+        uint8_t hex[64];
+        sha256_hex(text->data, text->len, hex);
+        if (memcmp(hex, r.hash, 64) != 0) return BJ_ERR_VERIFY;
     }
     return BJ_OK;
 }
@@ -336,11 +356,23 @@ static int add_version_inner(textlog *t, const uint8_t *text, uint32_t text_len,
         t->snapshot_ptr = offset;
         *out_type = TL_FULL_SNAPSHOT;
     } else {
+        /* Diff against the current version: from the cache when we still
+         * hold the text the previous addVersion wrote, otherwise rebuilt
+         * from the snapshot + diff chain. */
+        const uint8_t *prev_data;
+        size_t prev_len;
         dbuf prev; memset(&prev, 0, sizeof(prev));
-        e = reconstruct_version(t, t->version, &prev);
-        if (e) { dbuf_free(&prev); return e; }
+        if (t->has_latest_text) {
+            prev_data = t->latest_text.data;
+            prev_len = t->latest_text.len;
+        } else {
+            e = reconstruct_version(t, t->version, &prev);
+            if (e) { dbuf_free(&prev); return e; }
+            prev_data = prev.data;
+            prev_len = prev.len;
+        }
         uint8_t *patch = NULL; size_t plen = 0;
-        int de = diff_create_patch("document", prev.data, prev.len, text, text_len, &patch, &plen);
+        int de = diff_create_patch("document", prev_data, prev_len, text, text_len, &patch, &plen);
         dbuf_free(&prev);
         if (de) { free(patch); return diff_err_to_bj(de); }
         e = encode_entry(t, TL_DIFF, new_version, hash, 64, patch, (uint32_t)plen, ts_ms);
@@ -382,14 +414,38 @@ int textlog_add_version(textlog *t, const uint8_t *text, uint32_t text_len,
 
     tl_ent ent = { offset, t->version, type };
     t->ents[t->n_ents++] = ent;   /* capacity reserved above */
+    /* Remember the text just written so the next diff add needs no reads. */
+    t->latest_text.len = 0;
+    t->has_latest_text = dbuf_put(&t->latest_text, text, text_len) == BJ_OK;
     if (out_version) *out_version = t->version;
     return BJ_OK;
 }
 
+/* Versions are 1..current; checked here rather than trusting the host —
+ * a second embedder that forgets to validate gets BJ_ERR_RANGE, not the
+ * empty/latest text the raw reconstruction would silently produce. */
+static int version_in_range(const textlog *t, uint64_t version) {
+    return version >= 1 && version <= t->version;
+}
+
 int textlog_get_version(textlog *t, uint64_t version,
                         const uint8_t **out_ptr, size_t *out_len) {
+    if (!version_in_range(t, version)) return BJ_ERR_RANGE;
+    int e;
+    if (t->has_latest_text && version == t->version) {
+        /* The cache holds exactly the bytes the last add wrote (or a
+         * hash-verified reconstruction): serve it without touching the file. */
+        e = set_out(t, t->latest_text.data, t->latest_text.len);
+        if (e) return e;
+        *out_ptr = t->out.data; *out_len = t->out.len;
+        return BJ_OK;
+    }
     dbuf text; memset(&text, 0, sizeof(text));
-    int e = reconstruct_version(t, version, &text);
+    e = reconstruct_version(t, version, &text);
+    if (!e && version == t->version) {
+        t->latest_text.len = 0;
+        t->has_latest_text = dbuf_put(&t->latest_text, text.data, text.len) == BJ_OK;
+    }
     if (!e) e = set_out(t, text.data, text.len);
     dbuf_free(&text);
     if (e) return e;
@@ -399,6 +455,7 @@ int textlog_get_version(textlog *t, uint64_t version,
 
 int textlog_get_version_hash(textlog *t, uint64_t version,
                              const uint8_t **out_ptr, size_t *out_len) {
+    if (!version_in_range(t, version)) return BJ_ERR_RANGE;
     for (int i = t->n_ents - 1; i >= 0; i--) {
         if (t->ents[i].version != version) continue;
         const uint8_t *rec; size_t rec_len;
@@ -412,13 +469,15 @@ int textlog_get_version_hash(textlog *t, uint64_t version,
         *out_ptr = t->out.data; *out_len = t->out.len;
         return BJ_OK;
     }
-    return BJ_ERR_STATE; /* not found (host validates range, so unreachable) */
+    return BJ_ERR_STATE; /* in-range version missing from the index */
 }
 
 /* ---- getDiff -------------------------------------------------------- */
 
 int textlog_get_diff(textlog *t, uint64_t from_version, uint64_t to_version,
                      const uint8_t **out_ptr, size_t *out_len) {
+    if (!version_in_range(t, from_version) || !version_in_range(t, to_version))
+        return BJ_ERR_RANGE;
     dbuf from_text; memset(&from_text, 0, sizeof(from_text));
     dbuf to_text; memset(&to_text, 0, sizeof(to_text));
     int e = reconstruct_version(t, from_version, &from_text);
@@ -545,6 +604,7 @@ void textlog_free(textlog *t) {
     bj_builder_free(t->bld);
     bjfile_dispose(&t->f);
     free(t->out.data);
+    dbuf_free(&t->latest_text);
     free(t->ents);
     free(t);
 }

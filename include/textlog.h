@@ -18,8 +18,13 @@
  *     private to this implementation (only round-trip correctness is observable,
  *     so files need not interoperate with the JS log).
  *
- * The host validates version ranges and reports the human-readable errors; the
- * C API assumes valid arguments and returns BJ_OK (0) or a negative BJ_ERR_*
+ * Version arguments are validated here (outside 1..current -> BJ_ERR_RANGE),
+ * so a host that forgets its own checks gets a distinct error instead of
+ * silently empty or latest text. Reconstructed text is verified against the
+ * entry's stored SHA-256 (BJ_ERR_VERIFY on mismatch), catching diff-chain
+ * corruption at read time. The current version's text is cached in memory,
+ * so consecutive addVersion calls and reads of the latest version perform no
+ * reconstruction reads. All calls return BJ_OK (0) or a negative BJ_ERR_*
  * code from binjson.h.
  */
 #ifndef TEXTLOG_H
