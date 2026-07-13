@@ -44,4 +44,16 @@ static inline void dbuf_free(dbuf *b) {
     b->len = b->cap = 0;
 }
 
+/* A freshly malloc'd, independently-owned copy of p[0..n) -- for handing a
+ * result out of a function whose input buffers (a tree's transient output,
+ * a cursor batch, ...) won't outlive the call. */
+static inline int dbuf_dup(const uint8_t *p, size_t n, uint8_t **out, size_t *out_len) {
+    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
+    if (!buf) return BJ_ERR_OOM;
+    if (n) memcpy(buf, p, n);
+    *out = buf;
+    *out_len = n;
+    return BJ_OK;
+}
+
 #endif /* DBUF_H */

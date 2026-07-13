@@ -182,4 +182,34 @@ static inline int skip_value(cur *c) {
     c->pos += sz; return BJ_OK;
 }
 
+/*
+ * Look up `name` at the top level of binjson OBJECT `obj`. On success,
+ * *found = 1 and val_ptr/val_len span exactly the field's encoded value
+ * (type byte included), pointing into `obj`; *found = 0 if no such field.
+ */
+static inline int obj_get_field(const uint8_t *obj, size_t obj_len,
+                                const uint8_t *name, uint32_t name_len,
+                                const uint8_t **val_ptr, size_t *val_len, int *found) {
+    cur c = { obj, obj_len, 0 };
+    uint32_t count;
+    int e = object_begin(&c, &count);
+    if (e) return e;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *kp; uint32_t klen;
+        e = take_key(&c, &kp, &klen);
+        if (e) return e;
+        size_t vstart = c.pos;
+        e = skip_value(&c);
+        if (e) return e;
+        if (klen == name_len && memcmp(kp, name, name_len) == 0) {
+            *val_ptr = c.d + vstart;
+            *val_len = c.pos - vstart;
+            *found = 1;
+            return BJ_OK;
+        }
+    }
+    *found = 0;
+    return BJ_OK;
+}
+
 #endif /* BJCURSOR_H */
