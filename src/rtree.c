@@ -1626,3 +1626,21 @@ void rtree_free(rtree *t) {
 int64_t        rtree_size(const rtree *t)        { return t->size; }
 int            rtree_max_entries(const rtree *t) { return t->max_entries; }
 const uint8_t *rtree_out(const rtree *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }
+
+uint64_t rtree_file_len(const rtree *t) { return bjfile_len(&t->f); }
+
+int rtree_rewind(rtree *t, uint64_t len) {
+    uint64_t cur = bjfile_len(&t->f);
+    if (len == cur) return BJ_OK;
+    if (len > cur || len < RT_METADATA_SIZE) return BJ_ERR_STATE;
+    const uint8_t *rec; size_t rec_len;
+    int e = bjfile_read_record(&t->f, len - RT_METADATA_SIZE, &rec, &rec_len);
+    if (e) return e;
+    rt_meta m;
+    if (rec_len != RT_METADATA_SIZE ||
+        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
+        !meta_valid(&m, len - RT_METADATA_SIZE)) return BJ_ERR_STATE;
+    if ((e = bjfile_set_len(&t->f, len))) return e;
+    meta_apply(t, &m);
+    return BJ_OK;
+}

@@ -51,6 +51,18 @@ int            rtree_max_entries(const rtree *t);
 /* The last search output; writes its length through *len. */
 const uint8_t *rtree_out(const rtree *t, size_t *len);
 
+/* Current length of the backing file (committed + pending bytes). */
+uint64_t rtree_file_len(const rtree *t);
+/*
+ * Truncate the backing file to `len` — which must be a commit boundary (the
+ * bytes at len - RT_METADATA_SIZE must be a valid metadata record) — and
+ * reload the tree's state from it. Because the file is append-only, this
+ * atomically rewinds the tree to the state it had when that commit landed.
+ * Mirrors bpt_rewind (bplustree.h); used for cross-file transaction rollback
+ * (db.c's commit journal).
+ */
+int rtree_rewind(rtree *t, uint64_t len);
+
 /* ---- Spatial cursor ---------------------------------------------------- */
 
 /*
