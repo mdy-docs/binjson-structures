@@ -10,8 +10,15 @@
     "wasm",
     "src",
     "include",
-    "lib"
+    "lib",
+    "bin"
   ],
+  "bin": {
+    "bplustree": "bin/bplustree.js",
+    "rtree": "bin/rtree.js",
+    "textindex": "bin/textindex.js",
+    "textlog": "bin/textlog.js"
+  },
   "scripts": {
     "build:wasm": "./build-wasm.sh",
     "prepack": "npm run build:wasm"
