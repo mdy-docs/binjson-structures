@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>R-Tree (WASM) with OPFS Demo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; } h2 { color: #333; margin-top: 0; }
+    .container { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .controls { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; }
+    .field.grow { flex: 1 1 220px; }
+    button { background: #007bff; color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #0056b3; } button:disabled { background: #ccc; cursor: not-allowed; }
+    button.secondary { background: #6c757d; } button.secondary:hover { background: #5a6268; }
+    button.danger { background: #b02a37; } button.danger:hover { background: #8b1f29; }
+    .error { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .success { background: #d4edda; color: #155724; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .info { background: #d1ecf1; color: #0c5460; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .output { background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; padding: 15px; font-family: 'Courier New', monospace; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; max-height: 460px; overflow-y: auto; }
+    label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 13px; }
+    input[type="text"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+    input.short { width: 120px; }
+    code { background: #eef1f4; padding: 1px 5px; border-radius: 3px; }
+    pre.code { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>R-Tree (WebAssembly) with OPFS</h1>
+
+  <div class="container">
+    <div class="info">
+      This page demonstrates the <strong>WebAssembly</strong> R-tree
+      (<code>RTree</code> from <code>binjson-wasm.js</code>) — a durable,
+      append-only spatial index of <code>(lat, lng)</code> points, each tagged
+      with a 24-hex <code>ObjectId</code>. It answers bounding-box and radius
+      queries. All operations run in a <strong>Web Worker</strong>
+      (<code>public/worker.js</code>); this page sends it messages.
+    </div>
+    <div class="error" id="opfsWarning" style="display:none;"></div>
+  </div>
+
+  <div class="container">
+    <h2>How it's used</h2>
+    <pre class="code">import { RTree } from '@belteshazzar/binjson/wasm';
+import { ObjectId } from '@belteshazzar/binjson';
+
+const tree = new RTree(syncHandle, /* maxEntries */ 9);
+await tree.open();
+
+tree.insert(40.7128, -74.0060, new ObjectId());  // point + id
+const near = tree.searchRadius(40.71, -74.0, 500);  // {objectId,lat,lng,distance} within km
+const box  = tree.searchBBox({ minLat: 30, maxLat: 45, minLng: -80, maxLng: -70 });
+tree.remove(objectId);
+tree.size();
+await tree.compact(destSyncHandle);
+await tree.close();</pre>
+  </div>
+
+  <div class="container">
+    <h2>Tree file</h2>
+    <div class="controls">
+      <div class="field"><label for="filename">OPFS file</label><input type="text" id="filename" value="demo-rtree.bj" style="width:220px;"></div>
+      <div class="field"><label for="maxEntries">maxEntries (new)</label><input type="text" id="maxEntries" class="short" value="9"></div>
+      <button id="createBtn">Create / Reset</button>
+      <button id="infoBtn" class="secondary">Info</button>
+      <button id="clearBtn" class="secondary">Clear</button>
+      <button id="deleteFileBtn" class="danger">Delete file</button>
+    </div>
+    <div class="info" style="margin-bottom:0;">Latitude <code>-90..90</code>, longitude <code>-180..180</code>. Leave the ObjectId blank on insert to auto-generate one.</div>
+  </div>
+
+  <div class="container">
+    <h2>Operations</h2>
+
+    <div class="controls">
+      <div class="field"><label for="insLat">Lat</label><input type="text" id="insLat" class="short" value="40.7128"></div>
+      <div class="field"><label for="insLng">Lng</label><input type="text" id="insLng" class="short" value="-74.0060"></div>
+      <div class="field grow"><label for="insId">ObjectId (blank = random)</label><input type="text" id="insId" style="width:100%;" placeholder="24 hex chars, or leave blank"></div>
+      <button id="insertBtn">Insert</button>
+    </div>
+
+    <div class="controls">
+      <div class="field"><label for="radLat">Lat</label><input type="text" id="radLat" class="short" value="40.7128"></div>
+      <div class="field"><label for="radLng">Lng</label><input type="text" id="radLng" class="short" value="-74.0060"></div>
+      <div class="field"><label for="radKm">Radius (km)</label><input type="text" id="radKm" class="short" value="500"></div>
+      <button id="radiusBtn">Search radius</button>
+    </div>
+
+    <div class="controls">
+      <div class="field"><label for="bbMinLat">minLat</label><input type="text" id="bbMinLat" class="short" value="30"></div>
+      <div class="field"><label for="bbMaxLat">maxLat</label><input type="text" id="bbMaxLat" class="short" value="45"></div>
+      <div class="field"><label for="bbMinLng">minLng</label><input type="text" id="bbMinLng" class="short" value="-80"></div>
+      <div class="field"><label for="bbMaxLng">maxLng</label><input type="text" id="bbMaxLng" class="short" value="-70"></div>
+      <button id="bboxBtn">Search bbox</button>
+      <button id="listBtn" class="secondary">List all</button>
+    </div>
+
+    <div class="controls">
+      <div class="field grow"><label for="rmId">ObjectId to remove</label><input type="text" id="rmId" style="width:100%;" placeholder="24 hex chars"></div>
+      <button id="removeBtn" class="danger">Remove</button>
+    </div>
+
+    <div class="controls">
+      <div class="field"><label for="compactFile">Compact into</label><input type="text" id="compactFile" style="width:260px;" value="demo-rtree-compacted.bj"></div>
+      <button id="compactBtn" class="secondary">Compact</button>
+      <button id="seedBtn" class="secondary">Load sample cities</button>
+    </div>
+
+    <div id="message"></div>
+  </div>
+
+  <div class="container">
+    <h2>Output</h2>
+    <div id="output" class="output">No output yet…</div>
+  </div>
+
+  <script type="module">
+    const worker = new Worker('/site/worker.js', { type: 'module' });
+    let workerMessageId = 0;
+    const workerPromises = new Map();
+    worker.addEventListener('message', (event) => {
+      const { id, result, error } = event.data;
+      const p = workerPromises.get(id);
+      if (p) { error ? p.reject(new Error(error)) : p.resolve(result); workerPromises.delete(id); }
+    });
+    worker.addEventListener('error', (e) => showMessage(`Worker error: ${e.message}`, 'error'));
+    function callWorker(operation, filename, data) {
+      return new Promise((resolve, reject) => {
+        const id = ++workerMessageId;
+        workerPromises.set(id, { resolve, reject });
+        worker.postMessage({ id, operation, filename, data });
+      });
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const filename = () => $('filename').value.trim() || 'demo-rtree.bj';
+    const num = (id) => Number($(id).value);
+    const randomOid = () => Array.from({ length: 24 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+
+    function showMessage(msg, type = 'success') { $('message').innerHTML = `<div class="${type}">${msg}</div>`; }
+
+    // Point results carry an ObjectId; after the worker's structured clone it
+    // arrives as { id } (or a hex string) — normalize to a plain hex string.
+    function fmtPoint(p) {
+      const oid = p.objectId && typeof p.objectId === 'object' ? p.objectId.id : p.objectId;
+      const out = { objectId: oid, lat: p.lat, lng: p.lng };
+      if (typeof p.distance === 'number') out.distance = Number(p.distance.toFixed(3));
+      return out;
+    }
+    function show(value) {
+      $('output').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+    }
+    function showPoints(points) { show(points.map(fmtPoint)); }
+
+    async function createOrReset() {
+      const maxEntries = num('maxEntries') || 9;
+      await callWorker('delete', filename());
+      await callWorker('rtree-create', filename(), { order: maxEntries });
+      showMessage(`Created empty R-tree "${filename()}" (maxEntries ${maxEntries}).`);
+      show('(empty tree)');
+    }
+    async function insert() {
+      const lat = num('insLat'), lng = num('insLng');
+      const objectId = $('insId').value.trim() || randomOid();
+      await callWorker('rtree-insert', filename(), { lat, lng, objectId });
+      showMessage(`Inserted ${objectId} at (${lat}, ${lng}).`);
+      showPoints(await callWorker('rtree-list', filename()));
+    }
+    async function radius() {
+      const points = await callWorker('rtree-searchRadius', filename(), { lat: num('radLat'), lng: num('radLng'), radiusKm: num('radKm') });
+      showMessage(`${points.length} point(s) within ${num('radKm')} km.`);
+      showPoints(points);
+    }
+    async function bbox() {
+      const box = { minLat: num('bbMinLat'), maxLat: num('bbMaxLat'), minLng: num('bbMinLng'), maxLng: num('bbMaxLng') };
+      const points = await callWorker('rtree-searchBBox', filename(), { bbox: box });
+      showMessage(`${points.length} point(s) in the box.`);
+      showPoints(points);
+    }
+    async function listAll() {
+      const points = await callWorker('rtree-list', filename());
+      showMessage(`${points.length} point(s) total.`);
+      showPoints(points);
+    }
+    async function remove() {
+      const objectId = $('rmId').value.trim();
+      if (!objectId) { showMessage('Enter an ObjectId to remove.', 'error'); return; }
+      const res = await callWorker('rtree-remove', filename(), { objectId });
+      showMessage(res.removed ? `Removed ${objectId}.` : `${objectId} not found.`, res.removed ? 'success' : 'error');
+      showPoints(await callWorker('rtree-list', filename()));
+    }
+    async function info() {
+      const stats = await callWorker('rtree-info', filename());
+      showMessage(`size ${stats.size}, maxEntries ${stats.maxEntries}.`);
+      show(stats);
+    }
+    async function clear() {
+      const res = await callWorker('rtree-clear', filename());
+      showMessage(`Cleared ${res.cleared} point(s).`);
+      show('(empty tree)');
+    }
+    async function compact() {
+      const dest = $('compactFile').value.trim() || 'demo-rtree-compacted.bj';
+      await callWorker('delete', dest);
+      const stats = await callWorker('rtree-compact', filename(), { compactFilename: dest });
+      showMessage(`Compacted into "${dest}": ${stats.oldSize} → ${stats.newSize} bytes (saved ${stats.bytesSaved}).`);
+      show(stats);
+    }
+    async function deleteFile() {
+      await callWorker('delete', filename());
+      showMessage(`Deleted file "${filename()}".`);
+      show('(file deleted)');
+    }
+    async function seed() {
+      const maxEntries = num('maxEntries') || 9;
+      await callWorker('delete', filename());
+      await callWorker('rtree-create', filename(), { order: maxEntries });
+      const cities = [
+        ['New York', 40.7128, -74.0060], ['Los Angeles', 34.0522, -118.2437],
+        ['Chicago', 41.8781, -87.6298], ['Houston', 29.7604, -95.3698],
+        ['Boston', 42.3601, -71.0589], ['Philadelphia', 39.9526, -75.1652],
+      ];
+      for (const [, lat, lng] of cities) {
+        await callWorker('rtree-insert', filename(), { lat, lng, objectId: randomOid() });
+      }
+      showMessage(`Loaded ${cities.length} sample cities.`);
+      showPoints(await callWorker('rtree-list', filename()));
+    }
+
+    function wire(id, fn) { $(id).addEventListener('click', () => fn().catch((err) => { showMessage(`Error: ${err.message || err}`, 'error'); console.error(err); })); }
+    wire('createBtn', createOrReset); wire('infoBtn', info); wire('clearBtn', clear); wire('deleteFileBtn', deleteFile);
+    wire('insertBtn', insert); wire('radiusBtn', radius); wire('bboxBtn', bbox); wire('listBtn', listAll);
+    wire('removeBtn', remove); wire('compactBtn', compact); wire('seedBtn', seed);
+
+    window.addEventListener('load', () => {
+      const ok = typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory;
+      if (ok) return;
+      document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      const warn = $('opfsWarning'); warn.style.display = 'block';
+      warn.innerHTML = '<strong>OPFS is unavailable here.</strong> Open via <code>http://localhost:8083/public/rtree.html</code> (run <code>npm run serve</code>) or over https, in Chrome/Edge/Opera 102+ or Safari 16.4+.';
+    });
+  </script>
+</body>
+</html>

@@ -23,7 +23,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "build:wasm": "./build-wasm.sh",
-    "prepack": "npm run build:wasm"
+    "build:worker": "rollup -c rollup.config.js && cp lib/binjson-structures.wasm site/binjson-structures.wasm",
+    "prepack": "npm run build:wasm",
+    "serve": "http-server -c-1 . -p 8085"
   },
   "keywords": [
     "b-tree",
@@ -38,7 +40,11 @@
   "author": "",
   "license": "BSD-2-Clause",
   "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "http-server": "^14.1.1",
     "node-opfs": "^1.2.0",
+    "rollup": "^4.31.0",
     "stemmer": "^2.0.1",
     "vitest": "^3.2.4"
   },

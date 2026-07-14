@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>B+ Tree (WASM) with OPFS Demo</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 { color: #333; }
+    h2 { color: #333; margin-top: 0; }
+    .container {
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+      align-items: flex-end;
+    }
+    .field { display: flex; flex-direction: column; }
+    .field.grow { flex: 1 1 220px; }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 10px 18px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover { background: #0056b3; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    button.secondary { background: #6c757d; }
+    button.secondary:hover { background: #5a6268; }
+    button.danger { background: #b02a37; }
+    button.danger:hover { background: #8b1f29; }
+    .error { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .success { background: #d4edda; color: #155724; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .info { background: #d1ecf1; color: #0c5460; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .output {
+      background: #f8f9fa;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 15px;
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      max-height: 460px;
+      overflow-y: auto;
+    }
+    label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 13px; }
+    input[type="text"] {
+      padding: 8px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
+    input.short { width: 120px; }
+    input.grow { width: 100%; }
+    code { background: #eef1f4; padding: 1px 5px; border-radius: 3px; }
+    pre.code {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 16px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <h1>B+ Tree (WebAssembly) with OPFS</h1>
+
+  <div class="container">
+    <div class="info">
+      This page demonstrates the <strong>WebAssembly</strong> B+ tree
+      (<code>BPlusTree</code> from <code>binjson-wasm.js</code>). The tree is a
+      durable, append-only, sorted key&rarr;value store persisted to a single
+      OPFS file. Because it needs a <code>FileSystemSyncAccessHandle</code>, all
+      tree operations run inside a <strong>Web Worker</strong>
+      (<code>public/worker.js</code>); this page just sends it messages.
+    </div>
+    <div class="error" id="opfsWarning" style="display:none;"></div>
+  </div>
+
+  <div class="container">
+    <h2>How it's used</h2>
+    <div class="info">
+      Every button below drives this exact API inside the worker (see the
+      matching <code>bplustree-*</code> cases in <code>public/worker.js</code>):
+    </div>
+    <pre class="code">import { BPlusTree } from '@belteshazzar/binjson/wasm';
+
+// syncHandle is a FileSystemSyncAccessHandle (Web Worker only)
+const tree = new BPlusTree(syncHandle, /* order */ 4);
+await tree.open();
+
+tree.add('alpha', { id: 1 });     // insert or update
+tree.add(42, [1, 2, 3]);          // number or string keys
+const v = tree.search('alpha');   // -> { id: 1 }  (undefined if absent)
+const range = tree.rangeSearch(1, 100);   // sorted entries in [min, max]
+tree.delete(42);
+const all = tree.toArray();       // [{ key, value }, ...] sorted by key
+tree.size(); tree.getHeight();    // stats
+
+await tree.compact(destSyncHandle); // rewrite, dropping stale history
+await tree.close();</pre>
+  </div>
+
+  <div class="container">
+    <h2>Tree file</h2>
+    <div class="controls">
+      <div class="field">
+        <label for="filename">OPFS file</label>
+        <input type="text" id="filename" class="short" value="demo-bplustree.bj" style="width:220px;">
+      </div>
+      <div class="field">
+        <label for="order">Order (new tree)</label>
+        <input type="text" id="order" class="short" value="4">
+      </div>
+      <button id="createBtn">Create / Reset</button>
+      <button id="infoBtn" class="secondary">Info</button>
+      <button id="deleteFileBtn" class="danger">Delete file</button>
+    </div>
+    <div class="info" style="margin-bottom:0;">
+      Keys are read as <strong>numbers</strong> when they look numeric,
+      otherwise as <strong>strings</strong>. Values are parsed as JSON when
+      possible (e.g. <code>{"id":1}</code>, <code>42</code>, <code>true</code>),
+      falling back to a plain string.
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>Operations</h2>
+
+    <div class="controls">
+      <div class="field">
+        <label for="addKey">Key</label>
+        <input type="text" id="addKey" class="short" value="alpha">
+      </div>
+      <div class="field grow">
+        <label for="addValue">Value (JSON)</label>
+        <input type="text" id="addValue" class="grow" value='{"id":1,"label":"first"}'>
+      </div>
+      <button id="addBtn">Add / Update</button>
+    </div>
+
+    <div class="controls">
+      <div class="field">
+        <label for="searchKey">Key</label>
+        <input type="text" id="searchKey" class="short" value="alpha">
+      </div>
+      <button id="searchBtn">Search</button>
+      <button id="deleteKeyBtn" class="danger">Delete key</button>
+    </div>
+
+    <div class="controls">
+      <div class="field">
+        <label for="rangeMin">Min key</label>
+        <input type="text" id="rangeMin" class="short" value="a">
+      </div>
+      <div class="field">
+        <label for="rangeMax">Max key</label>
+        <input type="text" id="rangeMax" class="short" value="z">
+      </div>
+      <button id="rangeBtn">Range search</button>
+      <button id="listBtn" class="secondary">List all</button>
+    </div>
+
+    <div class="controls">
+      <div class="field">
+        <label for="compactFile">Compact into</label>
+        <input type="text" id="compactFile" style="width:260px;" value="demo-bplustree-compacted.bj">
+      </div>
+      <button id="compactBtn" class="secondary">Compact</button>
+      <button id="seedBtn" class="secondary">Load sample data</button>
+    </div>
+
+    <div id="message"></div>
+  </div>
+
+  <div class="container">
+    <h2>Output</h2>
+    <div id="output" class="output">No output yet…</div>
+  </div>
+
+  <script type="module">
+    // The WASM B+ tree runs in the worker; the page only orchestrates it.
+    const worker = new Worker('/site/worker.js', { type: 'module' });
+    let workerMessageId = 0;
+    const workerPromises = new Map();
+
+    worker.addEventListener('message', (event) => {
+      const { id, result, error } = event.data;
+      const promise = workerPromises.get(id);
+      if (promise) {
+        if (error) promise.reject(new Error(error));
+        else promise.resolve(result);
+        workerPromises.delete(id);
+      }
+    });
+    worker.addEventListener('error', (event) => {
+      showMessage(`Worker error: ${event.message}`, 'error');
+    });
+
+    function callWorker(operation, filename, data) {
+      return new Promise((resolve, reject) => {
+        const id = ++workerMessageId;
+        workerPromises.set(id, { resolve, reject });
+        worker.postMessage({ id, operation, filename, data });
+      });
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const filename = () => $('filename').value.trim() || 'demo-bplustree.bj';
+
+    // Numeric-looking keys become numbers; otherwise strings (the tree supports
+    // number and string keys). Mirrors bin/bplustree.js.
+    function parseKey(raw) {
+      const s = raw.trim();
+      return /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : s;
+    }
+    // Values: JSON when valid, else the literal string.
+    function parseValue(raw) {
+      try { return JSON.parse(raw); } catch { return raw; }
+    }
+
+    function showMessage(msg, type = 'success') {
+      $('message').innerHTML = `<div class="${type}">${msg}</div>`;
+    }
+    function show(value) {
+      $('output').textContent = typeof value === 'string'
+        ? value
+        : JSON.stringify(value, null, 2);
+    }
+
+    async function createOrReset() {
+      const order = Number($('order').value) || 3;
+      // Reset by removing any existing file first, then create a fresh tree.
+      await callWorker('delete', filename());
+      await callWorker('bplustree-create', filename(), { order });
+      showMessage(`Created empty B+ tree "${filename()}" (order ${order}).`);
+      show('(empty tree)');
+    }
+
+    async function add() {
+      const key = parseKey($('addKey').value);
+      const value = parseValue($('addValue').value);
+      await callWorker('bplustree-add', filename(), { key, value });
+      showMessage(`Added ${JSON.stringify(key)} = ${JSON.stringify(value)}.`);
+      show(await callWorker('bplustree-toArray', filename()));
+    }
+
+    async function search() {
+      const key = parseKey($('searchKey').value);
+      const res = await callWorker('bplustree-search', filename(), { key });
+      if (res.found) {
+        showMessage(`Found ${JSON.stringify(key)}.`);
+        show(res.value);
+      } else {
+        showMessage(`Key ${JSON.stringify(key)} not found.`, 'error');
+        show('(not found)');
+      }
+    }
+
+    async function deleteKey() {
+      const key = parseKey($('searchKey').value);
+      const res = await callWorker('bplustree-delete', filename(), { key });
+      showMessage(res.deleted
+        ? `Deleted ${JSON.stringify(key)}.`
+        : `Key ${JSON.stringify(key)} was not present.`, res.deleted ? 'success' : 'error');
+      show(await callWorker('bplustree-toArray', filename()));
+    }
+
+    async function rangeSearch() {
+      const min = parseKey($('rangeMin').value);
+      const max = parseKey($('rangeMax').value);
+      const entries = await callWorker('bplustree-range', filename(), { min, max });
+      showMessage(`Range [${JSON.stringify(min)}, ${JSON.stringify(max)}] → ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}.`);
+      show(entries);
+    }
+
+    async function listAll() {
+      const entries = await callWorker('bplustree-toArray', filename());
+      showMessage(`${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} (sorted by key).`);
+      show(entries);
+    }
+
+    async function info() {
+      const stats = await callWorker('bplustree-info', filename());
+      showMessage(`size ${stats.size}, height ${stats.height}, order ${stats.order}.`);
+      show(stats);
+    }
+
+    async function compact() {
+      const dest = $('compactFile').value.trim() || 'demo-bplustree-compacted.bj';
+      await callWorker('delete', dest);
+      const stats = await callWorker('bplustree-compact', filename(), { compactFilename: dest });
+      showMessage(`Compacted into "${dest}": ${stats.oldSize} → ${stats.newSize} bytes (saved ${stats.bytesSaved}).`);
+      show(stats);
+    }
+
+    async function deleteFile() {
+      await callWorker('delete', filename());
+      showMessage(`Deleted file "${filename()}".`);
+      show('(file deleted)');
+    }
+
+    async function seed() {
+      const order = Number($('order').value) || 4;
+      await callWorker('delete', filename());
+      await callWorker('bplustree-create', filename(), { order });
+      const sample = [
+        ['alpha', { id: 1, label: 'first' }],
+        ['beta', { id: 2, label: 'second' }],
+        ['gamma', { id: 3, label: 'third' }],
+        ['delta', { id: 4, label: 'fourth' }],
+        [10, 'ten'],
+        [42, 'forty-two'],
+        [7, 'seven'],
+      ];
+      for (const [key, value] of sample) {
+        await callWorker('bplustree-add', filename(), { key, value });
+      }
+      showMessage(`Loaded ${sample.length} sample entries into "${filename()}".`);
+      show(await callWorker('bplustree-toArray', filename()));
+    }
+
+    // Wrap handlers so any error surfaces in the UI instead of the console only.
+    function wire(id, fn) {
+      $(id).addEventListener('click', () => fn().catch((err) => {
+        showMessage(`Error: ${err.message || err}`, 'error');
+        console.error(err);
+      }));
+    }
+
+    wire('createBtn', createOrReset);
+    wire('infoBtn', info);
+    wire('deleteFileBtn', deleteFile);
+    wire('addBtn', add);
+    wire('searchBtn', search);
+    wire('deleteKeyBtn', deleteKey);
+    wire('rangeBtn', rangeSearch);
+    wire('listBtn', listAll);
+    wire('compactBtn', compact);
+    wire('seedBtn', seed);
+
+    // Disable everything with a clear message when OPFS isn't available.
+    window.addEventListener('load', () => {
+      const ok = typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory;
+      if (ok) return;
+      document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      const warn = $('opfsWarning');
+      warn.style.display = 'block';
+      warn.innerHTML =
+        '<strong>OPFS is unavailable here.</strong> The Origin Private File System ' +
+        'requires a <strong>secure context</strong> — open this page via ' +
+        '<code>http://localhost:8083/public/bplustree.html</code> (run ' +
+        '<code>npm run serve</code>) or over https, in Chrome/Edge/Opera 102+ or Safari 16.4+.';
+    });
+  </script>
+</body>
+</html>

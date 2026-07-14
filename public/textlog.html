@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Versioned Text Log (WASM) with OPFS Demo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; } h2 { color: #333; margin-top: 0; }
+    .container { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .controls { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; }
+    button { background: #007bff; color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #0056b3; } button:disabled { background: #ccc; cursor: not-allowed; }
+    button.secondary { background: #6c757d; } button.secondary:hover { background: #5a6268; }
+    button.danger { background: #b02a37; } button.danger:hover { background: #8b1f29; }
+    .error { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .success { background: #d4edda; color: #155724; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .info { background: #d1ecf1; color: #0c5460; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .output { background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; padding: 15px; font-family: 'Courier New', monospace; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; max-height: 460px; overflow-y: auto; }
+    label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 13px; }
+    input[type="text"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+    input.short { width: 90px; }
+    textarea { width: 100%; min-height: 120px; font-family: 'Courier New', monospace; font-size: 14px; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+    code { background: #eef1f4; padding: 1px 5px; border-radius: 3px; }
+    pre.code { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>Versioned Text Log (WebAssembly) with OPFS</h1>
+
+  <div class="container">
+    <div class="info">
+      This page demonstrates the <strong>WebAssembly</strong> text log
+      (<code>TextLog</code> from <code>binjson-wasm.js</code>) — an append-only
+      history of a document. Each <em>add</em> records a full version; the log
+      keeps periodic snapshots plus diffs so any past version can be
+      reconstructed and compared. It runs in a <strong>Web Worker</strong>.
+    </div>
+    <div class="error" id="opfsWarning" style="display:none;"></div>
+  </div>
+
+  <div class="container">
+    <h2>How it's used</h2>
+    <pre class="code">import { TextLog } from '@belteshazzar/binjson/wasm';
+
+const log = new TextLog(syncHandle, /* diffsPerSnapshot */ 10);
+await log.open();
+
+const v = await log.addVersion('the quick brown fox');  // -> version number
+const text = await log.getVersion(1);       // full text at a version
+const diff = await log.getDiff(1, 2);       // human-readable unified diff
+const hash = await log.getVersionHash(2);   // SHA-256 hex
+log.getCurrentVersion();                    // latest version number
+await log.close();</pre>
+  </div>
+
+  <div class="container">
+    <h2>Log file</h2>
+    <div class="controls">
+      <div class="field"><label for="filename">OPFS file</label><input type="text" id="filename" value="demo-textlog.bj" style="width:220px;"></div>
+      <div class="field"><label for="dps">diffsPerSnapshot</label><input type="text" id="dps" class="short" value="10"></div>
+      <button id="createBtn">Create / Reset</button>
+      <button id="infoBtn" class="secondary">Info</button>
+      <button id="listBtn" class="secondary">List versions</button>
+      <button id="deleteFileBtn" class="danger">Delete file</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>Add a version</h2>
+    <div class="field"><label for="text">Text (full snapshot of this version)</label>
+      <textarea id="text">the quick brown fox
+jumps over the lazy dog</textarea>
+    </div>
+    <div class="controls" style="margin-top:10px;">
+      <button id="addBtn">Add version</button>
+      <button id="seedBtn" class="secondary">Load sample history</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>Inspect</h2>
+    <div class="controls">
+      <div class="field"><label for="getV">Version</label><input type="text" id="getV" class="short" value="1"></div>
+      <button id="getBtn">Get text</button>
+      <button id="hashBtn" class="secondary">Hash</button>
+    </div>
+    <div class="controls">
+      <div class="field"><label for="diffFrom">From</label><input type="text" id="diffFrom" class="short" value="1"></div>
+      <div class="field"><label for="diffTo">To</label><input type="text" id="diffTo" class="short" value="2"></div>
+      <button id="diffBtn">Diff</button>
+    </div>
+    <div id="message"></div>
+  </div>
+
+  <div class="container">
+    <h2>Output</h2>
+    <div id="output" class="output">No output yet…</div>
+  </div>
+
+  <script type="module">
+    const worker = new Worker('/site/worker.js', { type: 'module' });
+    let workerMessageId = 0;
+    const workerPromises = new Map();
+    worker.addEventListener('message', (event) => {
+      const { id, result, error } = event.data;
+      const p = workerPromises.get(id);
+      if (p) { error ? p.reject(new Error(error)) : p.resolve(result); workerPromises.delete(id); }
+    });
+    worker.addEventListener('error', (e) => showMessage(`Worker error: ${e.message}`, 'error'));
+    function callWorker(operation, filename, data) {
+      return new Promise((resolve, reject) => {
+        const id = ++workerMessageId;
+        workerPromises.set(id, { resolve, reject });
+        worker.postMessage({ id, operation, filename, data });
+      });
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const filename = () => $('filename').value.trim() || 'demo-textlog.bj';
+    const dps = () => Number($('dps').value) || 10;
+
+    function showMessage(msg, type = 'success') { $('message').innerHTML = `<div class="${type}">${msg}</div>`; }
+    function show(value) { $('output').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+
+    async function createOrReset() {
+      await callWorker('delete', filename());
+      await callWorker('textlog-create', filename(), { diffsPerSnapshot: dps() });
+      showMessage(`Created empty log "${filename()}" (diffsPerSnapshot ${dps()}).`);
+      show('(no versions yet)');
+    }
+    async function add() {
+      const text = $('text').value;
+      const res = await callWorker('textlog-add', filename(), { text, diffsPerSnapshot: dps() });
+      showMessage(`Added version ${res.version}.`);
+      show(await callWorker('textlog-list', filename()));
+    }
+    async function getText() {
+      const version = Number($('getV').value);
+      const res = await callWorker('textlog-get', filename(), { version });
+      showMessage(`Version ${version}:`);
+      show(res.text);
+    }
+    async function hash() {
+      const version = Number($('getV').value);
+      const res = await callWorker('textlog-list', filename());
+      const found = res.find((r) => r.version === version);
+      showMessage(found ? `Hash of version ${version}:` : `No version ${version}.`, found ? 'success' : 'error');
+      show(found ? found.hash : '(not found)');
+    }
+    async function diff() {
+      const from = Number($('diffFrom').value), to = Number($('diffTo').value);
+      const res = await callWorker('textlog-diff', filename(), { from, to });
+      showMessage(`Diff ${from} → ${to}:`);
+      show(res.diff || '(versions are identical)');
+    }
+    async function info() {
+      const stats = await callWorker('textlog-info', filename());
+      showMessage(`${stats.versions} version(s), diffsPerSnapshot ${stats.diffsPerSnapshot}.`);
+      show(stats);
+    }
+    async function listVersions() {
+      const versions = await callWorker('textlog-list', filename());
+      showMessage(`${versions.length} version(s).`);
+      show(versions);
+    }
+    async function deleteFile() {
+      await callWorker('delete', filename());
+      showMessage(`Deleted file "${filename()}".`);
+      show('(file deleted)');
+    }
+    async function seed() {
+      await callWorker('delete', filename());
+      await callWorker('textlog-create', filename(), { diffsPerSnapshot: dps() });
+      const history = [
+        'the quick brown fox',
+        'the quick brown fox\njumps over the lazy dog',
+        'the quick red fox\njumps over the lazy dog',
+        'the quick red fox\njumps over the sleepy dog\nthe end',
+      ];
+      for (const text of history) await callWorker('textlog-add', filename(), { text, diffsPerSnapshot: dps() });
+      showMessage(`Loaded ${history.length} versions.`);
+      show(await callWorker('textlog-list', filename()));
+    }
+
+    function wire(id, fn) { $(id).addEventListener('click', () => fn().catch((err) => { showMessage(`Error: ${err.message || err}`, 'error'); console.error(err); })); }
+    wire('createBtn', createOrReset); wire('infoBtn', info); wire('listBtn', listVersions); wire('deleteFileBtn', deleteFile);
+    wire('addBtn', add); wire('getBtn', getText); wire('hashBtn', hash); wire('diffBtn', diff); wire('seedBtn', seed);
+
+    window.addEventListener('load', () => {
+      const ok = typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory;
+      if (ok) return;
+      document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      const warn = $('opfsWarning'); warn.style.display = 'block';
+      warn.innerHTML = '<strong>OPFS is unavailable here.</strong> Open via <code>http://localhost:8083/public/textlog.html</code> (run <code>npm run serve</code>) or over https, in Chrome/Edge/Opera 102+ or Safari 16.4+.';
+    });
+  </script>
+</body>
+</html>

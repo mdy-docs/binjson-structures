@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WASM Diff Demo</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --panel: #f6f8fa;
+      --border: #d0d7de;
+      --text: #1f2328;
+      --muted: #656d76;
+      --accent: #0969da;
+      --add-bg: #e6ffec; --add-fg: #116329;
+      --del-bg: #ffebe9; --del-fg: #82071e;
+      --hunk-fg: #8250df;
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117; --panel: #161b22; --border: #30363d;
+        --text: #e6edf3; --muted: #8b949e; --accent: #4493f8;
+        --add-bg: #12261e; --add-fg: #3fb950;
+        --del-bg: #25171c; --del-fg: #f85149;
+        --hunk-fg: #bc8cff;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    header { max-width: 1200px; margin: 0 auto 20px; }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    header p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+    header code { font-family: var(--mono); font-size: 0.85em; }
+    .cols {
+      max-width: 1200px; margin: 0 auto;
+      display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;
+    }
+    @media (max-width: 800px) { .cols { grid-template-columns: 1fr; } }
+    .col { display: flex; flex-direction: column; min-width: 0; }
+    .col h2 {
+      font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--muted); margin: 0 0 8px; display: flex; justify-content: space-between; align-items: baseline;
+    }
+    .col h2 .stat { font-weight: 400; text-transform: none; letter-spacing: 0; }
+    .stat .add { color: var(--add-fg); }
+    .stat .del { color: var(--del-fg); }
+    textarea, .diff {
+      font-family: var(--mono); font-size: 13px; line-height: 1.5;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--panel); color: var(--text);
+      height: 60vh; min-height: 320px;
+    }
+    textarea { padding: 10px 12px; resize: vertical; width: 100%; tab-size: 4; }
+    textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+    .diff { margin: 0; overflow: auto; padding: 0; white-space: pre; }
+    .diff .line { display: block; padding: 0 12px; }
+    .diff .add { background: var(--add-bg); color: var(--add-fg); }
+    .diff .del { background: var(--del-bg); color: var(--del-fg); }
+    .diff .hunk { color: var(--hunk-fg); }
+    .diff .filehdr { color: var(--muted); font-weight: 600; }
+    .diff .nonl { color: var(--muted); font-style: italic; }
+    .diff .same { color: var(--text); }
+    .notice {
+      max-width: 1200px; margin: 16px auto 0; padding: 12px 14px;
+      border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+      color: var(--muted); font-size: 0.85rem;
+    }
+    .notice code { font-family: var(--mono); }
+    .err { border-color: var(--del-fg); color: var(--del-fg); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Diff, running in WebAssembly</h1>
+    <p>Edit either version — the middle column is the unified diff, computed live by the C
+       port of <code>diff</code> (jsdiff) compiled to WASM (<code>c/diff.c</code> → <code>src/binjson-wasm.js</code>).</p>
+  </header>
+
+  <div class="cols">
+    <div class="col">
+      <h2>Version 1</h2>
+      <textarea id="a" spellcheck="false"></textarea>
+    </div>
+    <div class="col">
+      <h2>Diff <span class="stat" id="stat"></span></h2>
+      <pre class="diff" id="diff"></pre>
+    </div>
+    <div class="col">
+      <h2>Version 2</h2>
+      <textarea id="b" spellcheck="false"></textarea>
+    </div>
+  </div>
+
+  <div class="notice" id="notice" hidden></div>
+
+  <script type="module">
+    import { ready, unifiedDiff } from '/wasm/binjson-structures-wasm.js';
+
+    const $a = document.getElementById('a');
+    const $b = document.getElementById('b');
+    const $diff = document.getElementById('diff');
+    const $stat = document.getElementById('stat');
+    const $notice = document.getElementById('notice');
+
+    $a.value = [
+      'The quick brown fox',
+      'jumps over',
+      'the lazy dog.',
+      '',
+      'Shared closing line.'
+    ].join('\n');
+    $b.value = [
+      'The quick brown fox',
+      'leaps over',
+      'the sleepy dog.',
+      'A brand new line!',
+      '',
+      'Shared closing line.'
+    ].join('\n');
+
+    // Classify a unified-diff line for colorizing.
+    function classOf(line) {
+      if (line.startsWith('--- ') || line.startsWith('+++ ')) return 'filehdr';
+      if (line.startsWith('@@')) return 'hunk';
+      if (line.startsWith('\\')) return 'nonl';
+      if (line.startsWith('+')) return 'add';
+      if (line.startsWith('-')) return 'del';
+      return 'same';
+    }
+
+    function render() {
+      let text;
+      try {
+        text = unifiedDiff($a.value, $b.value);
+      } catch (e) {
+        $notice.hidden = false; $notice.classList.add('err');
+        $notice.textContent = 'Diff error: ' + e.message;
+        return;
+      }
+      // Trailing newline yields a final empty element; drop it for display.
+      const lines = text.split('\n');
+      if (lines.length && lines[lines.length - 1] === '') lines.pop();
+
+      $diff.replaceChildren();
+      let added = 0, removed = 0;
+      for (const line of lines) {
+        const cls = classOf(line);
+        if (cls === 'add') added++;
+        if (cls === 'del') removed++;
+        const span = document.createElement('span');
+        span.className = 'line ' + cls;
+        span.textContent = line === '' ? '​' : line; // keep blank lines visible
+        $diff.appendChild(span);
+      }
+      $stat.innerHTML = `<span class="add">+${added}</span> <span class="del">−${removed}</span>`;
+    }
+
+    try {
+      await ready();
+      $a.addEventListener('input', render);
+      $b.addEventListener('input', render);
+      render();
+    } catch (e) {
+      $notice.hidden = false; $notice.classList.add('err');
+      $notice.innerHTML = 'Failed to load the WASM module. Serve this page over HTTP — from the repo root run ' +
+        '<code>npm run serve</code> and open <code>http://localhost:8083/public/diff.html</code> ' +
+        '(the module cannot be fetched from a <code>file://</code> URL). Details: ' + e.message;
+    }
+  </script>
+</body>
+</html>

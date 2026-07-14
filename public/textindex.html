@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Full-Text Index (WASM) with OPFS Demo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #333; } h2 { color: #333; margin-top: 0; }
+    .container { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .controls { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; }
+    .field.grow { flex: 1 1 220px; }
+    button { background: #007bff; color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #0056b3; } button:disabled { background: #ccc; cursor: not-allowed; }
+    button.secondary { background: #6c757d; } button.secondary:hover { background: #5a6268; }
+    button.danger { background: #b02a37; } button.danger:hover { background: #8b1f29; }
+    .error { background: #f8d7da; color: #721c24; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .success { background: #d4edda; color: #155724; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .info { background: #d1ecf1; color: #0c5460; padding: 10px; border-radius: 4px; margin-bottom: 10px; }
+    .output { background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px; padding: 15px; font-family: 'Courier New', monospace; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; max-height: 460px; overflow-y: auto; }
+    label { display: block; margin-bottom: 5px; font-weight: bold; font-size: 13px; }
+    input[type="text"] { padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+    input.short { width: 140px; }
+    label.chk { display: inline-flex; align-items: center; gap: 5px; font-weight: normal; }
+    code { background: #eef1f4; padding: 1px 5px; border-radius: 3px; }
+    pre.code { background: #1e1e1e; color: #d4d4d4; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>Full-Text Index (WebAssembly) with OPFS</h1>
+
+  <div class="container">
+    <div class="info">
+      This page demonstrates the <strong>WebAssembly</strong> full-text index
+      (<code>TextIndex</code> from <code>binjson-wasm.js</code>). It tokenizes,
+      stems, and BM25-ranks documents, stored across three OPFS B+ tree files
+      (<code>&lt;name&gt;-terms.bj</code>, <code>-documents.bj</code>,
+      <code>-lengths.bj</code>). All operations run in a <strong>Web Worker</strong>.
+    </div>
+    <div class="error" id="opfsWarning" style="display:none;"></div>
+  </div>
+
+  <div class="container">
+    <h2>How it's used</h2>
+    <pre class="code">import { TextIndex, BPlusTree } from '@belteshazzar/binjson/wasm';
+
+// three B+ trees, one per file, share a base name
+const index = new TextIndex({ trees: { index, documentTerms, documentLengths } });
+await index.open();
+
+await index.add('doc1', 'the quick brown fox');   // index a document
+const ranked = await index.query('quick brown');  // [{ id, score }] BM25
+const ids    = await index.query('quick', { scored: false });  // just ids
+const both   = await index.query('quick brown', { requireAll: true }); // AND
+await index.remove('doc1');
+await index.getDocumentCount();
+await index.close();</pre>
+  </div>
+
+  <div class="container">
+    <h2>Index</h2>
+    <div class="controls">
+      <div class="field"><label for="baseName">Base name</label><input type="text" id="baseName" value="demo-index" style="width:220px;"></div>
+      <button id="createBtn">Create / Reset</button>
+      <button id="infoBtn" class="secondary">Info</button>
+      <button id="listBtn" class="secondary">List documents</button>
+      <button id="clearBtn" class="secondary">Clear</button>
+      <button id="deleteBtn" class="danger">Delete files</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <h2>Operations</h2>
+
+    <div class="controls">
+      <div class="field"><label for="docId">Document id</label><input type="text" id="docId" class="short" value="doc1"></div>
+      <div class="field grow"><label for="docText">Text</label><input type="text" id="docText" style="width:100%;" value="the quick brown fox"></div>
+      <button id="addBtn">Add / Update</button>
+      <button id="removeBtn" class="danger">Remove</button>
+    </div>
+
+    <div class="controls">
+      <div class="field grow"><label for="queryText">Query</label><input type="text" id="queryText" style="width:100%;" value="quick brown"></div>
+      <label class="chk"><input type="checkbox" id="qAll"> require all terms (AND)</label>
+      <label class="chk"><input type="checkbox" id="qIds"> ids only</label>
+      <button id="queryBtn">Query</button>
+    </div>
+
+    <div class="controls">
+      <button id="seedBtn" class="secondary">Load sample documents</button>
+    </div>
+
+    <div id="message"></div>
+  </div>
+
+  <div class="container">
+    <h2>Output</h2>
+    <div id="output" class="output">No output yet…</div>
+  </div>
+
+  <script type="module">
+    const worker = new Worker('/site/worker.js', { type: 'module' });
+    let workerMessageId = 0;
+    const workerPromises = new Map();
+    worker.addEventListener('message', (event) => {
+      const { id, result, error } = event.data;
+      const p = workerPromises.get(id);
+      if (p) { error ? p.reject(new Error(error)) : p.resolve(result); workerPromises.delete(id); }
+    });
+    worker.addEventListener('error', (e) => showMessage(`Worker error: ${e.message}`, 'error'));
+    function callWorker(operation, filename, data) {
+      return new Promise((resolve, reject) => {
+        const id = ++workerMessageId;
+        workerPromises.set(id, { resolve, reject });
+        worker.postMessage({ id, operation, filename, data });
+      });
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const base = () => $('baseName').value.trim() || 'demo-index';
+    const suffixes = ['-terms.bj', '-documents.bj', '-lengths.bj'];
+
+    function showMessage(msg, type = 'success') { $('message').innerHTML = `<div class="${type}">${msg}</div>`; }
+    function show(value) { $('output').textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2); }
+
+    async function deleteFiles(name) { for (const s of suffixes) await callWorker('delete', `${name}${s}`); }
+
+    async function createOrReset() {
+      await deleteFiles(base());
+      await callWorker('textindex-create', base(), { baseName: base(), order: 16 });
+      showMessage(`Created empty index "${base()}".`);
+      show('(empty index)');
+    }
+    async function add() {
+      const docId = $('docId').value.trim();
+      const text = $('docText').value;
+      if (!docId) { showMessage('Enter a document id.', 'error'); return; }
+      await callWorker('textindex-add', base(), { baseName: base(), docId, text });
+      showMessage(`Indexed "${docId}".`);
+      show(await callWorker('textindex-list', base(), { baseName: base() }));
+    }
+    async function remove() {
+      const docId = $('docId').value.trim();
+      const res = await callWorker('textindex-remove', base(), { baseName: base(), docId });
+      showMessage(res.removed ? `Removed "${docId}".` : `"${docId}" not found.`, res.removed ? 'success' : 'error');
+      show(await callWorker('textindex-list', base(), { baseName: base() }));
+    }
+    async function query() {
+      const queryText = $('queryText').value;
+      const requireAll = $('qAll').checked;
+      const scored = !$('qIds').checked;
+      const options = { requireAll, scored };
+      const results = await callWorker('textindex-query', base(), { baseName: base(), queryText, options });
+      const mode = requireAll ? 'AND (ids)' : scored ? 'ranked' : 'ids';
+      showMessage(`Query "${queryText}" [${mode}] → ${results.length} result(s).`);
+      show(results);
+    }
+    async function info() {
+      const stats = await callWorker('textindex-info', base(), { baseName: base() });
+      showMessage(`${stats.terms} term(s), ${stats.documents} document(s).`);
+      show(stats);
+    }
+    async function listDocs() {
+      const ids = await callWorker('textindex-list', base(), { baseName: base() });
+      showMessage(`${ids.length} document(s).`);
+      show(ids);
+    }
+    async function clear() {
+      const res = await callWorker('textindex-clear', base(), { baseName: base() });
+      showMessage(`Cleared ${res.cleared} document(s).`);
+      show('(empty index)');
+    }
+    async function deleteAll() {
+      await deleteFiles(base());
+      showMessage(`Deleted the three files for "${base()}".`);
+      show('(files deleted)');
+    }
+    async function seed() {
+      await deleteFiles(base());
+      await callWorker('textindex-create', base(), { baseName: base(), order: 16 });
+      const docs = [
+        ['post-1', 'the quick brown fox jumps over the lazy dog'],
+        ['post-2', 'a lazy brown dog sleeps in the sun'],
+        ['post-3', 'quick foxes are clever and brown'],
+        ['post-4', 'the sun rises over the quiet hills'],
+      ];
+      for (const [docId, text] of docs) await callWorker('textindex-add', base(), { baseName: base(), docId, text });
+      showMessage(`Loaded ${docs.length} sample documents.`);
+      show(await callWorker('textindex-list', base(), { baseName: base() }));
+    }
+
+    function wire(id, fn) { $(id).addEventListener('click', () => fn().catch((err) => { showMessage(`Error: ${err.message || err}`, 'error'); console.error(err); })); }
+    wire('createBtn', createOrReset); wire('infoBtn', info); wire('listBtn', listDocs); wire('clearBtn', clear); wire('deleteBtn', deleteAll);
+    wire('addBtn', add); wire('removeBtn', remove); wire('queryBtn', query); wire('seedBtn', seed);
+
+    window.addEventListener('load', () => {
+      const ok = typeof navigator !== 'undefined' && navigator.storage && navigator.storage.getDirectory;
+      if (ok) return;
+      document.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      const warn = $('opfsWarning'); warn.style.display = 'block';
+      warn.innerHTML = '<strong>OPFS is unavailable here.</strong> Open via <code>http://localhost:8083/public/textindex.html</code> (run <code>npm run serve</code>) or over https, in Chrome/Edge/Opera 102+ or Safari 16.4+.';
+    });
+  </script>
+</body>
+</html>
