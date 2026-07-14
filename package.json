@@ -20,6 +20,8 @@
     "textlog": "bin/textlog.js"
   },
   "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
     "build:wasm": "./build-wasm.sh",
     "prepack": "npm run build:wasm"
   },
@@ -34,5 +36,14 @@
     "binjson"
   ],
   "author": "",
-  "license": "BSD-2-Clause"
+  "license": "BSD-2-Clause",
+  "devDependencies": {
+    "node-opfs": "^1.2.0",
+    "stemmer": "^2.0.1",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "fs-ext@2.1.1": true
+  }
 }
