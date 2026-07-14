@@ -1,0 +1,31 @@
+{
+  "name": "binjson-structures",
+  "version": "1.0.0",
+  "description": "WASM/C B+ tree, R-tree, text log, and text index data structures, built on the binjson wire format and file model",
+  "type": "module",
+  "exports": {
+    "./wasm": "./wasm/binjson-structures-wasm.js"
+  },
+  "files": [
+    "wasm",
+    "src",
+    "include",
+    "lib"
+  ],
+  "scripts": {
+    "build:wasm": "./build-wasm.sh",
+    "prepack": "npm run build:wasm"
+  },
+  "keywords": [
+    "b-tree",
+    "r-tree",
+    "spatial-index",
+    "text-index",
+    "full-text-search",
+    "wasm",
+    "opfs",
+    "binjson"
+  ],
+  "author": "",
+  "license": "BSD-2-Clause"
+}
