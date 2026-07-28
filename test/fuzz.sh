@@ -20,6 +20,6 @@ cc -std=c11 -g -O1 -Wall -Wextra -Werror \
    -o "$OUT" \
    test/fuzz.c third_party/binjson/src/binjson.c \
    src/bjfile.c src/bplustree.c src/rtree.c src/textlog.c \
-   src/textindex.c src/stemmer.c src/diff.c src/geo.c
+   src/entrylog.c src/textindex.c src/stemmer.c src/diff.c src/geo.c
 
 "$OUT" "${1:-20000}" "${2:-1}"

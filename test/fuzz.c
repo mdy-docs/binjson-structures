@@ -21,6 +21,7 @@
 #include "rtree.h"
 #include "textlog.h"
 #include "textindex.h"
+#include "entrylog.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +132,30 @@ static int seed_textlog(dbuf *img) {
                                 1700000000000LL + i, &v)) break;
     }
     textlog_free(t);
+    return 0;
+}
+
+static int seed_entrylog(dbuf *img) {
+    bj_io io = mem_io(img);
+    elog *t = elog_create(&io);
+    if (!t) return -1;
+    /* A realistic history: entries across rising terms, a commit-index
+     * update, a truncation, and re-appended replacements — so mutated
+     * images hit the metadata, entry, and truncation-replay paths. */
+    elog_set_hard_state(t, 2, 7);
+    char text[64];
+    for (int i = 0; i < 10; i++) {
+        int n = snprintf(text, sizeof(text), "command %d payload\n", i);
+        uint64_t idx;
+        if (elog_append(t, i < 5 ? 1 : 2, EL_NORMAL,
+                        (const uint8_t *)text, (uint32_t)n, &idx)) break;
+    }
+    elog_set_commit_index(t, 4);
+    elog_sync(t);
+    elog_truncate_from(t, 8);
+    elog_append(t, 2, EL_CONFIG, (const uint8_t *)"cfg", 3, NULL);
+    elog_sync(t);
+    elog_free(t);
     return 0;
 }
 
@@ -245,6 +270,33 @@ static void ex_textlog(dbuf *img) {
     textlog_free(t);
 }
 
+static void ex_entrylog(dbuf *img) {
+    bj_io io = mem_io(img);
+    elog *t = elog_open(&io);
+    if (!t) return;
+    const uint8_t *p; size_t n;
+    uint64_t base = elog_base_index(t), last = elog_last_index(t);
+    if (last - base > 32) last = base + 32;   /* bound hostile metadata */
+    uint64_t term; int type, count;
+    for (uint64_t i = base + 1; i <= last; i++) {
+        elog_get(t, i, &term, &type, &p, &n);
+        elog_term_at(t, i, &term);
+    }
+    elog_get_batch(t, base + 1, 4096, &count, &p, &n);
+    elog_verify(t);
+    elog_set_commit_index(t, base + rnd() % (last - base + 1));
+    elog_truncate_from(t, base + 1 + rnd() % (last - base + 1));
+    elog_set_hard_state(t, elog_current_term(t) + 1, 3);
+    elog_append(t, elog_current_term(t), EL_NOOP,
+                (const uint8_t *)"mutated", 7, NULL);
+    elog_sync(t);
+    dbuf dst; memset(&dst, 0, sizeof(dst));
+    bj_io dio = mem_io(&dst);
+    elog_compact(t, &dio, elog_base_index(t), elog_base_term(t));
+    dbuf_free(&dst);
+    elog_free(t);
+}
+
 /* The text index runs its own decoders (postings, term maps, lengths) over
  * blobs stored in B+ trees; pointing all three roles at one fuzzed tree
  * exercises them against arbitrary bytes. */
@@ -290,8 +342,14 @@ static void run_one(int which, dbuf *img) {
     case 0: ex_bpt(img); break;
     case 1: ex_rtree(img); break;
     case 2: ex_textlog(img); break;
+    case 3: ex_entrylog(img); break;
     default: ex_textindex(img); break;
     }
+}
+
+/* Seed image for a structure selector (textindex fuzzes a bpt image). */
+static int seed_for(int which) {
+    return which == 4 ? 0 : which;
 }
 
 #ifdef BJFUZZ_LIBFUZZER
@@ -300,7 +358,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 2) return 0;
     dbuf img; memset(&img, 0, sizeof(img));
     if (dbuf_put(&img, data + 1, size - 1)) return 0;
-    run_one(data[0] % 4, &img);
+    run_one(data[0] % 5, &img);
     dbuf_free(&img);
     return 0;
 }
@@ -321,18 +379,19 @@ int main(int argc, char **argv) {
     uint64_t iters = argc > 1 ? strtoull(argv[1], NULL, 10) : 20000;
     uint64_t seed0 = argc > 2 ? strtoull(argv[2], NULL, 10) : 1;
 
-    dbuf seeds[3];
+    dbuf seeds[4];
     memset(seeds, 0, sizeof(seeds));
-    if (seed_bpt(&seeds[0]) || seed_rtree(&seeds[1]) || seed_textlog(&seeds[2])) {
+    if (seed_bpt(&seeds[0]) || seed_rtree(&seeds[1]) || seed_textlog(&seeds[2]) ||
+        seed_entrylog(&seeds[3])) {
         fprintf(stderr, "seed construction failed\n");
         return 2;
     }
     signal(SIGALRM, on_alarm);
 
     /* Sanity: every structure must handle its own unmutated seed. */
-    for (int w = 0; w < 4; w++) {
+    for (int w = 0; w < 5; w++) {
         dbuf img; memset(&img, 0, sizeof(img));
-        if (dbuf_put(&img, seeds[w % 3].data, seeds[w % 3].len)) return 2;
+        if (dbuf_put(&img, seeds[seed_for(w)].data, seeds[seed_for(w)].len)) return 2;
         alarm(20);
         run_one(w, &img);
         alarm(0);
@@ -343,8 +402,8 @@ int main(int argc, char **argv) {
         cur_iter = i;
         cur_seed = seed0 + i;
         rng_state = cur_seed * 0x9E3779B97F4A7C15ULL + 1;
-        cur_which = (int)(rnd() % 4);
-        const dbuf *src = &seeds[cur_which % 3];   /* textindex fuzzes a bpt */
+        cur_which = (int)(rnd() % 5);
+        const dbuf *src = &seeds[seed_for(cur_which)];
 
         dbuf img; memset(&img, 0, sizeof(img));
         if (dbuf_put(&img, src->data, src->len)) return 2;
@@ -358,7 +417,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "  %llu iterations\n", (unsigned long long)(i + 1));
     }
 
-    for (int s = 0; s < 3; s++) dbuf_free(&seeds[s]);
+    for (int s = 0; s < 4; s++) dbuf_free(&seeds[s]);
     fprintf(stderr, "OK: %llu iterations, seeds %llu..%llu\n",
             (unsigned long long)iters, (unsigned long long)seed0,
             (unsigned long long)(seed0 + iters - 1));

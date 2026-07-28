@@ -65,6 +65,13 @@ EXPORTS='_malloc,_free,'\
 '_tlw_add_version,_tlw_get_version,_tlw_get_version_hash,_tlw_get_diff,'\
 '_tlw_version,_tlw_base_version,_tlw_diffs_per_snapshot,'\
 '_tlw_out_ptr,_tlw_out_len,'\
+`# entrylog`\
+'_elw_create_at,_elw_open,_elw_free,'\
+'_elw_append,_elw_sync,_elw_set_hard_state,_elw_set_commit_index,'\
+'_elw_get,_elw_get_batch,_elw_truncate_from,_elw_compact,_elw_verify,'\
+'_elw_term_at,_elw_base_index,_elw_base_term,_elw_last_index,_elw_last_term,'\
+'_elw_current_term,_elw_voted_for,_elw_commit_index,_elw_file_len,'\
+'_elw_out_ptr,_elw_out_len,'\
 `# diff`\
 '_diff_create_patch,_diff_get_diff,_diff_apply_patch,'\
 '_diff_create_delta,_diff_apply_delta,'\
@@ -80,6 +87,7 @@ SOURCES=(
   src/bplustree.c src/bplustree_wasm.c
   src/geo.c src/rtree.c src/rtree_wasm.c
   src/diff.c src/textlog.c src/textlog_wasm.c
+  src/entrylog.c src/entrylog_wasm.c
   src/stemmer.c src/textindex.c src/textindex_wasm.c
 )
 

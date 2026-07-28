@@ -7,6 +7,11 @@ wire format and file model:
 - **R-tree** (`RTree`) — spatial index (bounding-box search, k-nearest, geo/haversine).
 - **Text log** (`TextLog`/`TiledTextLog`) — versioned text storage with compact binary deltas.
 - **Text index** (`TextIndex`) — full-text search (BM25 scoring, Porter stemming), itself built on the B+ tree above.
+- **Entry log** (`EntryLog`) — replicated-command log (a Raft log, which is
+  also a write-ahead log): contiguous term-tagged entries with explicit
+  sync-for-durability, durable Raft hard state (currentTerm/votedFor),
+  logical suffix truncation (the Raft conflict rule), and snapshot-boundary
+  prefix compaction/tiling.
 
 Split out from the parent `binjson` document-database project (currently
 staged ahead of becoming its own git submodule/repo there — see that

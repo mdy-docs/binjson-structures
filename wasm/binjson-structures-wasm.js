@@ -1484,6 +1484,307 @@ const ENTRY_TYPE = {
 };
 
 // ---------------------------------------------------------------------------
+// Entry log (Raft log / write-ahead log)
+// ---------------------------------------------------------------------------
+
+// Entry type conventions (mirror the EL_* bytes in entrylog.h). Stored and
+// returned verbatim, never interpreted by the log; values >= 0x10 are free
+// for host use.
+const ENTRYLOG_TYPE = {
+  NORMAL: 0x01,   // state-machine command (opaque payload)
+  NOOP: 0x02,     // leader's empty entry committed on election
+  CONFIG: 0x03    // cluster membership change
+};
+
+/**
+ * Persistent replicated-command log (the Raft log, which is also the
+ * database's write-ahead log) with append-only WASM-backed storage — see
+ * include/entrylog.h for the design.
+ *
+ * Entries are (index, term, type, payload): indexes are assigned by the log
+ * and strictly contiguous, terms monotonically non-decreasing, payloads
+ * opaque bytes. append() only buffers; an entry is durable once sync()
+ * returns (one write + flush) — acknowledge replication RPCs only after
+ * that. Hard state (currentTerm/votedFor) commits immediately via
+ * setHardState(), as Raft requires before answering any RPC.
+ */
+class EntryLog {
+  /**
+   * @param {FileSystemSyncAccessHandle} syncHandle - storage file handle
+   * @param {object} [options]
+   * @param {number} [options.baseIndex=0] - when creating a fresh file, the
+   *   snapshot boundary this tile continues from: it owns indexes
+   *   (baseIndex, ...]. Ignored when opening an existing file.
+   * @param {number} [options.baseTerm=0] - term of entry baseIndex (the
+   *   snapshot's lastIncludedTerm). Ignored when opening an existing file.
+   */
+  constructor(syncHandle, { baseIndex = 0, baseTerm = 0 } = {}) {
+    this.syncAccessHandle = syncHandle;
+    this._createBaseIndex = baseIndex;
+    this._createBaseTerm = baseTerm;
+    this.isOpen = false;
+    this.ctx = 0;
+    this._fd = 0;
+  }
+
+  /**
+   * Open the log against the file handle. The C side is file-resident: open
+   * scans the file once (verifying every protected commit's CRC, recovering
+   * a torn tail by truncation) to index entry offsets, then every read
+   * fetches only the records it needs.
+   */
+  async open() {
+    if (this.isOpen) {
+      throw new Error('EntryLog is already open');
+    }
+    const M = await ready();
+
+    this._fd = registerHandle(M, this.syncAccessHandle);
+    const fileSize = this.syncAccessHandle.getSize();
+    if (fileSize > 0) {
+      this.ctx = M._elw_open(this._fd);
+      if (!this.ctx) {
+        unregisterHandle(M, this._fd);
+        await this.syncAccessHandle.close(); // isOpen never becomes true, so this.close() can't reach it -- must release it here
+        throw new Error('Invalid entry log file');
+      }
+    } else {
+      this.ctx = M._elw_create_at(this._fd, this._createBaseIndex, this._createBaseTerm);
+      if (!this.ctx) {
+        unregisterHandle(M, this._fd);
+        await this.syncAccessHandle.close();
+        throw new Error('Failed to create EntryLog');
+      }
+    }
+    this.isOpen = true;
+  }
+
+  /** fsync the file handle (all committed writes are already on it). */
+  flush() {
+    this.syncAccessHandle.flush();
+  }
+
+  /** Close the sync handle and release the WASM context. Buffered
+   * (un-synced) appends are NOT written — they were never acknowledged. */
+  async close() {
+    if (!this.isOpen) return;
+    if (this.syncAccessHandle) {
+      this.flush();
+      await this.syncAccessHandle.close();
+    }
+    if (this.ctx) {
+      Module._elw_free(this.ctx);
+      this.ctx = 0;
+    }
+    unregisterHandle(Module, this._fd);
+    this._fd = 0;
+    this.isOpen = false;
+  }
+
+  _ensureOpen() {
+    if (!this.isOpen) throw new Error('EntryLog is not open');
+  }
+
+  /** Tile base: the log holds indexes (baseIndex, lastIndex]. */
+  get baseIndex() { this._ensureOpen(); return requireModule()._elw_base_index(this.ctx); }
+  /** Term of entry baseIndex (the snapshot boundary's term). */
+  get baseTerm() { this._ensureOpen(); return requireModule()._elw_base_term(this.ctx); }
+  /** Highest index in the log (== baseIndex when empty). */
+  get lastIndex() { this._ensureOpen(); return requireModule()._elw_last_index(this.ctx); }
+  /** Term of the highest entry (== baseTerm when empty). */
+  get lastTerm() { this._ensureOpen(); return requireModule()._elw_last_term(this.ctx); }
+  /** Raft hard state, as of the last committed metadata record. */
+  get currentTerm() { this._ensureOpen(); return requireModule()._elw_current_term(this.ctx); }
+  /** Voted-for node id this term (0 = none). */
+  get votedFor() { this._ensureOpen(); return requireModule()._elw_voted_for(this.ctx); }
+  /** Advisory commit index (0 if never recorded). */
+  get commitIndex() { this._ensureOpen(); return requireModule()._elw_commit_index(this.ctx); }
+
+  /** Payload marshalling: a Uint8Array passes verbatim, a string as UTF-8. */
+  _allocPayload(payload) {
+    const M = Module;
+    let bytes = null;
+    if (payload instanceof Uint8Array) bytes = payload;
+    else if (typeof payload === 'string') bytes = encoder.encode(payload);
+    else throw new Error('Payload must be a Uint8Array or string');
+    const len = bytes.length;
+    const ptr = M._malloc(len || 1);
+    if (len) M.HEAPU8.set(bytes, ptr);
+    return { ptr, len, free() { M._free(ptr); } };
+  }
+
+  /**
+   * Buffer one entry with index lastIndex + 1. `term` must be between the
+   * current lastTerm and currentTerm (persist a term bump with
+   * setHardState() first). NOT durable until sync().
+   * @returns {number} the assigned index
+   */
+  append(term, payload, type = ENTRYLOG_TYPE.NORMAL) {
+    this._ensureOpen();
+    const M = requireModule();
+    const p = this._allocPayload(payload);
+    try {
+      const index = M._elw_append(this.ctx, term, type, p.ptr, p.len);
+      if (index < 0) throw codeError(index, 'append');
+      return index;
+    } finally {
+      p.free();
+    }
+  }
+
+  /**
+   * Commit everything buffered since the last sync as one protected commit
+   * and fsync it — the durability point. Acknowledge an AppendEntries RPC,
+   * or count local persistence toward a quorum, only after this returns.
+   */
+  sync() {
+    this._ensureOpen();
+    const rc = requireModule()._elw_sync(this.ctx);
+    if (rc !== 0) throw codeError(rc, 'sync');
+    this.flush();
+  }
+
+  /**
+   * Persist Raft hard state (currentTerm, votedFor). Commits and fsyncs
+   * immediately (plus any buffered entries): answer the RequestVote /
+   * AppendEntries RPC only after this returns. A new term resets any
+   * previous vote; changing an existing vote within its term throws.
+   */
+  setHardState(term, votedFor = 0) {
+    this._ensureOpen();
+    const rc = requireModule()._elw_set_hard_state(this.ctx, term, votedFor);
+    if (rc !== 0) throw codeError(rc, 'setHardState');
+    this.flush();
+  }
+
+  /**
+   * Record the commit index (highest index known replicated to a quorum).
+   * Advisory — Raft rederives it after restart — so this only stages the
+   * value; it rides along with the next sync().
+   */
+  setCommitIndex(index) {
+    this._ensureOpen();
+    const rc = requireModule()._elw_set_commit_index(this.ctx, index);
+    if (rc !== 0) throw codeError(rc, 'setCommitIndex');
+  }
+
+  /** Term of entry `index`; baseIndex answers baseTerm (the AppendEntries
+   * consistency check at the snapshot boundary). Served from memory. */
+  termAt(index) {
+    this._ensureOpen();
+    const term = requireModule()._elw_term_at(this.ctx, index);
+    if (term < 0) throw codeError(term, 'termAt');
+    return term;
+  }
+
+  /**
+   * Read one entry (one file read).
+   * @returns {{index:number,term:number,type:number,payload:Uint8Array}}
+   */
+  get(index) {
+    this._ensureOpen();
+    const M = requireModule();
+    const slots = M._malloc(16);   // f64 term at +0, i32 type at +8
+    try {
+      const rc = M._elw_get(this.ctx, index, slots);
+      if (rc !== 0) throw codeError(rc, 'get');
+      const heap = M.HEAPU8;
+      const dv = new DataView(heap.buffer, heap.byteOffset + slots, 16);
+      const term = dv.getFloat64(0, true);
+      const type = dv.getInt32(8, true);
+      const ptr = M._elw_out_ptr(this.ctx);
+      const len = M._elw_out_len(this.ctx);
+      if (len < 0) throw codeError(len, 'get');
+      return { index, term, type, payload: M.HEAPU8.slice(ptr, ptr + len) };
+    } finally {
+      M._free(slots);
+    }
+  }
+
+  /**
+   * Pull entries in bulk for an AppendEntries batch or the apply loop:
+   * entries from `fromIndex` upward until roughly `maxBytes` of payload is
+   * gathered (always at least one) or the log ends. fromIndex at or below
+   * baseIndex throws (compacted entries live in the snapshot — answer with
+   * InstallSnapshot instead); fromIndex beyond lastIndex returns [].
+   * @returns {Array<{index:number,term:number,type:number,payload:Uint8Array}>}
+   */
+  getBatch(fromIndex, maxBytes = 65536) {
+    this._ensureOpen();
+    const M = requireModule();
+    const n = M._elw_get_batch(this.ctx, fromIndex, maxBytes);
+    if (n < 0) throw codeError(n, 'getBatch');
+    if (n === 0) return [];
+    const ptr = M._elw_out_ptr(this.ctx);
+    const len = M._elw_out_len(this.ctx);
+    if (len < 0) throw codeError(len, 'getBatch');
+    return decode(M.HEAPU8.slice(ptr, ptr + len));
+  }
+
+  /**
+   * Discard entries from `index` upward (the Raft conflict rule) and commit
+   * the truncation immediately. Logical: dead bytes stay in the file until
+   * compact(). Entries at or below commitIndex may not be truncated, and
+   * buffered appends must be synced first.
+   */
+  truncateFrom(index) {
+    this._ensureOpen();
+    const rc = requireModule()._elw_truncate_from(this.ctx, index);
+    if (rc !== 0) throw codeError(rc, 'truncateFrom');
+    this.flush();
+  }
+
+  /**
+   * Walk every live entry checking the log's invariants: contiguous
+   * indexes, monotonically non-decreasing terms, stored records matching
+   * the in-memory index, bounds matching the metadata. Returns true, or
+   * throws describing the corruption. O(N).
+   */
+  verify() {
+    this._ensureOpen();
+    const rc = requireModule()._elw_verify(this.ctx);
+    if (rc !== 0) throw codeError(rc, 'verify');
+    return true;
+  }
+
+  /**
+   * Rewrite the live entries above the snapshot boundary (newBaseIndex,
+   * whose term must be newBaseTerm) into a fresh file, dropping compacted
+   * entries, truncated dead bytes, and superseded metadata. Hard state
+   * carries over; commitIndex carries over raised to at least newBaseIndex.
+   * The host adopts the destination file in place of the old one.
+   * @param {FileSystemSyncAccessHandle} destSyncHandle
+   * @returns {Promise<{oldSize:number,newSize:number,bytesSaved:number}>}
+   */
+  async compact(destSyncHandle, newBaseIndex, newBaseTerm) {
+    this._ensureOpen();
+    if (!destSyncHandle) {
+      throw new Error('Destination sync handle is required for compaction');
+    }
+    const M = requireModule();
+    const oldSize = this.syncAccessHandle.getSize();
+
+    destSyncHandle.truncate(0);
+    const dstFd = registerHandle(M, destSyncHandle);
+    try {
+      const rc = M._elw_compact(this.ctx, dstFd, newBaseIndex, newBaseTerm);
+      if (rc !== 0) throw codeError(rc, 'compact');
+    } finally {
+      unregisterHandle(M, dstFd);
+    }
+    const newSize = destSyncHandle.getSize();
+    destSyncHandle.flush();
+    await destSyncHandle.close();
+
+    return {
+      oldSize,
+      newSize,
+      bytesSaved: Math.max(0, oldSize - newSize)
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Full-text index
 // ---------------------------------------------------------------------------
 
@@ -1790,6 +2091,8 @@ export {
   RTree,
   TextLog,
   TiledTextLog,
+  EntryLog,
+  ENTRYLOG_TYPE,
   TextIndex,
   ENTRY_TYPE,
   stemmer,
