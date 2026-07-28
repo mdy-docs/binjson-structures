@@ -1,0 +1,23 @@
+# C sources this package contributes to a WASM build, one per line,
+# relative to the package root. Consumed by build-wasm.sh; a consumer
+# linking these sources into its own combined binary reads this same
+# list and prefixes each line with its checkout path (e.g.
+# third_party/binjson-structures/) instead of hand-mirroring it.
+# binjson itself is not listed -- every consumer links its own binjson
+# checkout alongside these.
+src/bjfile.c
+src/bjfile_wasm.c
+src/hostio.c
+src/bplustree.c
+src/bplustree_wasm.c
+src/geo.c
+src/rtree.c
+src/rtree_wasm.c
+src/diff.c
+src/textlog.c
+src/textlog_wasm.c
+src/entrylog.c
+src/entrylog_wasm.c
+src/stemmer.c
+src/textindex.c
+src/textindex_wasm.c
