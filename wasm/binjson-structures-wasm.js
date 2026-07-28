@@ -1832,6 +1832,357 @@ class EntryLog {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot store (Raft snapshot manifest & crash-safe adoption)
+// ---------------------------------------------------------------------------
+
+/**
+ * CRC-32 of `bytes` (zlib polynomial — the exact routine that protects
+ * every file commit, c/bjfile.c). Incremental: pass the previous value as
+ * `prev` to continue a running checksum over streamed chunks. Requires the
+ * module to be instantiated (await ready()).
+ */
+function crc32(bytes, prev = 0) {
+  const M = requireModule();
+  const CH = 65536;
+  let crc = prev >>> 0;
+  const ptr = M._malloc(Math.min(bytes.length, CH) || 1);
+  try {
+    for (let off = 0; off < bytes.length; off += CH) {
+      const chunk = bytes.subarray(off, Math.min(off + CH, bytes.length));
+      M.HEAPU8.set(chunk, ptr);
+      crc = M._bjfw_crc32(crc, ptr, chunk.length) >>> 0;
+    }
+  } finally {
+    M._free(ptr);
+  }
+  return crc;
+}
+
+/**
+ * Crash-safe storage for Raft state-machine snapshots (and the compacted
+ * entry-log files that pair with them), built on a naming convention
+ * instead of atomic rename — OPFS has neither rename nor multi-file
+ * atomicity, so adoption works like the commit protocol inside the data
+ * files themselves: write everything, then write one small record whose
+ * validity IS the commit.
+ *
+ * A snapshot is one *generation*: the immutable files
+ *
+ *   <prefix>-<gen>-<role>.bj          one per structure (host-chosen roles)
+ *   <prefix>-<gen>.manifest.bj        written LAST — the commit point
+ *
+ * The manifest records { lastIncludedIndex, lastIncludedTerm, config,
+ * files: [{ role, name, size, crc }] } as binjson followed by a CRC-32 of
+ * those bytes, so a torn manifest never validates. open() adopts the
+ * highest generation whose manifest validates and whose files are all
+ * present at their recorded sizes, then sweeps every other generation's
+ * files (a crashed snapshot attempt leaves data files with no manifest;
+ * an adopted newer generation obsoletes older ones). Deletions are
+ * best-effort — a locked or missing file is simply retried at the next
+ * open() — so no failure here can lose the adopted snapshot.
+ *
+ * Generation files are immutable copies: take one by compacting each
+ * structure into tx.createFile(role) (bpt_compact works from a live tree's
+ * MVCC snapshot, so applies continue meanwhile), then tx.commit(meta). A
+ * follower installing a leader's snapshot streams chunks into the same
+ * shape and commits with the leader's meta; commit() recomputes each
+ * file's CRC, so a corrupted transfer fails validation against the
+ * leader's manifest before anything is adopted. To go live after install,
+ * copy the snapshot files to the database's own live filenames
+ * (copyFile) — the generation stays immutable and prunable.
+ *
+ * The paired entry-log convention: after a snapshot commits, compact the
+ * log through (lastIncludedIndex, lastIncludedTerm) into createLogFile()
+ * — named <prefix>-log-<gen>.bj — then pruneLogs(). On open, try
+ * logCandidates() newest-first with EntryLog.open and adopt the first
+ * that succeeds: a crash mid-compaction leaves a torn newest file that
+ * fails to open, falling back to the previous one, which is only ever
+ * deleted after its successor is durable.
+ */
+class SnapshotStore {
+  /**
+   * @param {FileSystemDirectoryHandle} dirHandle - directory the snapshot
+   *   files live in (e.g. navigator.storage.getDirectory() or a subdir)
+   * @param {object} [options]
+   * @param {string} [options.prefix='snap'] - filename prefix
+   */
+  constructor(dirHandle, { prefix = 'snap' } = {}) {
+    this.dir = dirHandle;
+    this.prefix = prefix;
+    this.isOpen = false;
+    this._latest = null;
+    this._nextGen = 1;
+  }
+
+  _manifestName(gen) { return `${this.prefix}-${gen}.manifest.bj`; }
+  _dataName(gen, role) { return `${this.prefix}-${gen}-${role}.bj`; }
+  _logName(gen) { return `${this.prefix}-log-${gen}.bj`; }
+
+  async _sync(name, create = false) {
+    const fh = await this.dir.getFileHandle(name, { create });
+    return fh.createSyncAccessHandle();
+  }
+
+  async _remove(name) {
+    try { await this.dir.removeEntry(name); } catch (e) { /* best-effort */ }
+  }
+
+  /** Size and streamed CRC-32 of a stored file. */
+  async _crcOfFile(name) {
+    const h = await this._sync(name);
+    try {
+      const size = h.getSize();
+      const CH = 65536;
+      const buf = new Uint8Array(Math.min(CH, size) || 1);
+      let crc = 0;
+      for (let at = 0; at < size; at += CH) {
+        const n = Math.min(CH, size - at);
+        const view = buf.subarray(0, n);
+        h.read(view, { at });
+        crc = crc32(view, crc);
+      }
+      return { size, crc };
+    } finally {
+      await h.close();
+    }
+  }
+
+  /** Parse + validate a manifest file; null if torn/corrupt/misshapen. */
+  async _loadManifest(name) {
+    let bytes;
+    try {
+      const h = await this._sync(name);
+      bytes = new Uint8Array(h.getSize());
+      if (bytes.length) h.read(bytes, { at: 0 });
+      await h.close();
+    } catch (e) {
+      return null;
+    }
+    if (bytes.length < 5) return null;
+    const body = bytes.subarray(0, bytes.length - 4);
+    const want = new DataView(bytes.buffer, bytes.byteOffset + body.length, 4).getUint32(0, true);
+    if (crc32(body) !== want) return null;
+    let m;
+    try { m = decode(body); } catch (e) { return null; }
+    if (!m || m.snapshot !== 1 || !Array.isArray(m.files)) return null;
+    if (typeof m.lastIncludedIndex !== 'number' || typeof m.lastIncludedTerm !== 'number') return null;
+    for (const f of m.files) {
+      if (typeof f.role !== 'string' || typeof f.name !== 'string' ||
+          typeof f.size !== 'number' || typeof f.crc !== 'number') return null;
+    }
+    return m;
+  }
+
+  /**
+   * Scan the directory, adopt the newest valid generation (manifest
+   * validates, every file present at its recorded size), and sweep the
+   * files of every other generation — crashed attempts and superseded
+   * snapshots alike. Log files are untouched (see pruneLogs).
+   */
+  async open() {
+    if (this.isOpen) throw new Error('SnapshotStore is already open');
+    await ready();
+
+    const manifestRe = new RegExp(`^${this.prefix}-(\\d+)\\.manifest\\.bj$`);
+    const dataRe = new RegExp(`^${this.prefix}-(\\d+)-([A-Za-z0-9_-]+)\\.bj$`);
+    const logRe = new RegExp(`^${this.prefix}-log-(\\d+)\\.bj$`);
+
+    const gens = new Map();   // gen -> { manifestName, files: Map(role -> name) }
+    const at = (gen) => {
+      let g = gens.get(gen);
+      if (!g) { g = { manifestName: null, files: new Map() }; gens.set(gen, g); }
+      return g;
+    };
+    let maxGen = 0;
+    for await (const [name] of this.dir.entries()) {
+      let m;
+      if ((m = name.match(manifestRe))) at(Number(m[1])).manifestName = name;
+      else if ((m = name.match(dataRe))) at(Number(m[1])).files.set(m[2], name);
+      else if ((m = name.match(logRe))) { /* separate lifecycle */ }
+      else continue;
+      if (m[1] !== undefined) maxGen = Math.max(maxGen, Number(m[1]) || 0);
+    }
+
+    let adopted = null;
+    for (const gen of [...gens.keys()].sort((a, b) => b - a)) {
+      const g = gens.get(gen);
+      if (!g.manifestName) continue;
+      const meta = await this._loadManifest(g.manifestName);
+      if (!meta) continue;
+      let ok = true;
+      for (const f of meta.files) {
+        if (g.files.get(f.role) !== f.name || f.name !== this._dataName(gen, f.role)) { ok = false; break; }
+        try {
+          const h = await this._sync(f.name);
+          const size = h.getSize();
+          await h.close();
+          if (size !== f.size) { ok = false; break; }
+        } catch (e) { ok = false; break; }
+      }
+      if (ok) { adopted = { gen, ...meta }; break; }
+    }
+
+    for (const [gen, g] of gens) {
+      if (adopted && gen === adopted.gen) continue;
+      if (g.manifestName) await this._remove(g.manifestName);
+      for (const name of g.files.values()) await this._remove(name);
+    }
+
+    this._latest = adopted;
+    this._nextGen = maxGen + 1;
+    this.isOpen = true;
+  }
+
+  /** The adopted snapshot: { gen, lastIncludedIndex, lastIncludedTerm,
+   * config, files: [{ role, name, size, crc }] }, or null if none. */
+  get latest() {
+    return this._latest;
+  }
+
+  _ensureOpen() {
+    if (!this.isOpen) throw new Error('SnapshotStore is not open');
+  }
+
+  /**
+   * Start writing a new generation. Write each structure into
+   * tx.createFile(role) (e.g. via compact(), which closes the handle),
+   * then tx.commit({ lastIncludedIndex, lastIncludedTerm, config }) — the
+   * commit point. Nothing is visible (and open() sweeps the files) until
+   * commit returns; abort() deletes them eagerly.
+   */
+  async begin() {
+    this._ensureOpen();
+    const gen = this._nextGen++;
+    const created = new Map();   // role -> name
+    const store = this;
+    return {
+      gen,
+      async createFile(role) {
+        if (!/^[A-Za-z0-9_-]+$/.test(role)) throw new Error(`Invalid snapshot role: ${role}`);
+        if (created.has(role)) throw new Error(`Duplicate snapshot role: ${role}`);
+        const name = store._dataName(gen, role);
+        created.set(role, name);
+        return store._sync(name, true);
+      },
+      async commit({ lastIncludedIndex, lastIncludedTerm, config = null }) {
+        const files = [];
+        for (const [role, name] of created) {
+          const { size, crc } = await store._crcOfFile(name);
+          files.push({ role, name, size, crc });
+        }
+        const body = encode({ snapshot: 1, lastIncludedIndex, lastIncludedTerm, config, files });
+        const out = new Uint8Array(body.length + 4);
+        out.set(body, 0);
+        new DataView(out.buffer).setUint32(body.length, crc32(body), true);
+        const h = await store._sync(store._manifestName(gen), true);
+        h.truncate(0);
+        h.write(out, { at: 0 });
+        h.flush();
+        await h.close();
+
+        const prev = store._latest;
+        store._latest = { gen, lastIncludedIndex, lastIncludedTerm, config, files };
+        if (prev) {
+          await store._remove(store._manifestName(prev.gen));
+          for (const f of prev.files) await store._remove(f.name);
+        }
+        return store._latest;
+      },
+      async abort() {
+        for (const name of created.values()) await store._remove(name);
+        created.clear();
+      }
+    };
+  }
+
+  /** Open a role file of the adopted snapshot for reading (e.g. to serve
+   * InstallSnapshot chunks). Caller closes the handle. */
+  async openFile(role) {
+    this._ensureOpen();
+    if (!this._latest) throw new Error('No snapshot to open');
+    const f = this._latest.files.find((x) => x.role === role);
+    if (!f) throw new Error(`No snapshot file for role: ${role}`);
+    return this._sync(f.name);
+  }
+
+  /** Stream-copy a role file of the adopted snapshot into `destSyncHandle`
+   * (the database's live filename after an install). Closes the
+   * destination handle; verifies the copied bytes against the manifest CRC. */
+  async copyFile(role, destSyncHandle) {
+    const src = await this.openFile(role);
+    try {
+      const f = this._latest.files.find((x) => x.role === role);
+      const CH = 65536;
+      const buf = new Uint8Array(Math.min(CH, f.size) || 1);
+      let crc = 0;
+      destSyncHandle.truncate(0);
+      for (let at = 0; at < f.size; at += CH) {
+        const n = Math.min(CH, f.size - at);
+        const view = buf.subarray(0, n);
+        src.read(view, { at });
+        crc = crc32(view, crc);
+        destSyncHandle.write(view, { at });
+      }
+      if (crc !== f.crc) throw new Error(`Snapshot file ${f.name} failed its checksum`);
+      destSyncHandle.flush();
+    } finally {
+      await src.close();
+      await destSyncHandle.close();
+    }
+  }
+
+  /** Re-checksum every file of the adopted snapshot against the manifest.
+   * Returns true, or throws naming the corrupt file. O(total bytes). */
+  async verify() {
+    this._ensureOpen();
+    if (!this._latest) throw new Error('No snapshot to verify');
+    for (const f of this._latest.files) {
+      const { size, crc } = await this._crcOfFile(f.name);
+      if (size !== f.size || crc !== f.crc) {
+        throw new Error(`Snapshot file ${f.name} failed its checksum`);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Fresh file for the entry log compacted at the adopted snapshot's
+   * boundary: <prefix>-log-<gen>.bj. Returns { name, handle }; write via
+   * EntryLog.compact (which closes the handle), then pruneLogs(name).
+   */
+  async createLogFile() {
+    this._ensureOpen();
+    if (!this._latest) throw new Error('No snapshot to pair a log with');
+    const name = this._logName(this._latest.gen);
+    return { name, handle: await this._sync(name, true) };
+  }
+
+  /** Existing entry-log files, newest generation first. Try each with
+   * EntryLog.open and adopt the first that succeeds (a torn newest file
+   * fails to open; its predecessor is only deleted after a successor is
+   * durable). */
+  async logCandidates() {
+    this._ensureOpen();
+    const logRe = new RegExp(`^${this.prefix}-log-(\\d+)\\.bj$`);
+    const found = [];
+    for await (const [name] of this.dir.entries()) {
+      const m = name.match(logRe);
+      if (m) found.push({ gen: Number(m[1]), name });
+    }
+    return found.sort((a, b) => b.gen - a.gen).map((f) => f.name);
+  }
+
+  /** Delete every entry-log file except `keepName` (call once the newly
+   * compacted log is durable). Best-effort, like all sweeps here. */
+  async pruneLogs(keepName) {
+    this._ensureOpen();
+    for (const name of await this.logCandidates()) {
+      if (name !== keepName) await this._remove(name);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Full-text index
 // ---------------------------------------------------------------------------
 
@@ -2164,6 +2515,8 @@ export {
   TiledTextLog,
   EntryLog,
   ENTRYLOG_TYPE,
+  SnapshotStore,
+  crc32,
   TextIndex,
   ENTRY_TYPE,
   stemmer,

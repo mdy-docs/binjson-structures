@@ -47,6 +47,8 @@ EXPORTS='_malloc,_free,'\
 '_bjw_put_key,_bjw_begin_array,_bjw_end_array,_bjw_begin_object,_bjw_end_object,'\
 '_bjw_enc_finish,_bjw_enc_ptr,_bjw_enc_size,'\
 '_bjw_decode,_bjw_events_ptr,_bjw_events_len,_bjw_consumed,_bjw_value_size,'\
+`# bjfile helpers (SnapshotStore manifest checksums)`\
+'_bjfw_crc32,'\
 `# bplustree (also used by textindex)`\
 '_bptw_create,_bptw_open,_bptw_free,'\
 '_bptw_snapshot,_bptw_open_at,_bptw_boundaries,_bptw_is_snapshot,'\
@@ -86,7 +88,7 @@ EXPORTS='_malloc,_free,'\
 
 SOURCES=(
   third_party/binjson/src/binjson.c third_party/binjson/src/binjson_wasm.c
-  src/bjfile.c src/hostio.c
+  src/bjfile.c src/bjfile_wasm.c src/hostio.c
   src/bplustree.c src/bplustree_wasm.c
   src/geo.c src/rtree.c src/rtree_wasm.c
   src/diff.c src/textlog.c src/textlog_wasm.c

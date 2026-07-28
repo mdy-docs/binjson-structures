@@ -16,6 +16,11 @@ wire format and file model:
   commit metadata (`setAppliedIndex` before the mutation, persisted
   atomically with it), so crash-recovery replay knows exactly where to
   resume per structure.
+- **Snapshot store** (`SnapshotStore`) — crash-safe manifest & adoption
+  convention for Raft state-machine snapshots (and the compacted entry-log
+  files paired with them): generation-numbered immutable files committed by
+  a CRC-protected manifest written last, adopted newest-valid-first on
+  open, with chunked read/copy for InstallSnapshot transfer.
 
 Split out from the parent `binjson` document-database project (currently
 staged ahead of becoming its own git submodule/repo there — see that
