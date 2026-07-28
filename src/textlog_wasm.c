@@ -66,6 +66,13 @@ EMSCRIPTEN_KEEPALIVE double tlw_version(textlog *t)            { return (double)
 EMSCRIPTEN_KEEPALIVE double tlw_base_version(textlog *t)       { return (double)textlog_base_version(t); }
 EMSCRIPTEN_KEEPALIVE int    tlw_diffs_per_snapshot(textlog *t) { return textlog_diffs_per_snapshot(t); }
 
+/* Replicated-log integration (see textlog.h): the last applied log index,
+ * staged here and persisted with the next addVersion's commit. */
+EMSCRIPTEN_KEEPALIVE double tlw_applied_index(textlog *t) { return (double)textlog_applied_index(t); }
+EMSCRIPTEN_KEEPALIVE int    tlw_set_applied_index(textlog *t, double index) {
+    return textlog_set_applied_index(t, (uint64_t)index);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *tlw_out_ptr(textlog *t) {
     size_t n; return textlog_out(t, &n);
 }

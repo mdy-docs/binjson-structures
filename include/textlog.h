@@ -70,6 +70,17 @@ void textlog_free(textlog *t);
 
 /* Accessors (mirror the JS metadata fields). */
 uint64_t       textlog_version(const textlog *t);
+/*
+ * Replicated-log integration: the last log index applied to this log,
+ * recorded in every commit's metadata so crash-recovery replay knows where
+ * to resume (stage the entry's index before textlog_add_version; the
+ * version's commit persists both atomically). 0 = not log-driven (field
+ * omitted on the wire, keeping such files byte-identical to older
+ * formats). Sticky once set; never decreases (BJ_ERR_STATE). Restored by
+ * open. See bpt_set_applied_index.
+ */
+uint64_t       textlog_applied_index(const textlog *t);
+int            textlog_set_applied_index(textlog *t, uint64_t index);
 /* Highest global version owned by an earlier tile (0 for a standalone log): a
  * tile serves versions in (base_version, version]. */
 uint64_t       textlog_base_version(const textlog *t);

@@ -53,17 +53,20 @@ EXPORTS='_malloc,_free,'\
 '_bptw_add,_bptw_delete,_bptw_search,_bptw_entries,_bptw_range,_bptw_height,_bptw_verify,_bptw_compact,'\
 '_bptw_cursor_open,_bptw_cursor_next,_bptw_cursor_free,'\
 '_bptw_size,_bptw_root,_bptw_next_id,_bptw_order,'\
+'_bptw_applied_index,_bptw_set_applied_index,'\
 '_bptw_out_ptr,_bptw_out_len,'\
 `# rtree`\
 '_rtw_create,_rtw_open,_rtw_free,'\
 '_rtw_insert,_rtw_remove,_rtw_remove_at,_rtw_clear,_rtw_search,_rtw_search_radius,_rtw_haversine,_rtw_compact,'\
 '_rtw_cursor_open,_rtw_cursor_next,_rtw_cursor_free,_rtw_nearest,'\
 '_rtw_size,_rtw_max_entries,'\
+'_rtw_applied_index,_rtw_set_applied_index,'\
 '_rtw_out_ptr,_rtw_out_len,'\
 `# textlog`\
 '_tlw_create,_tlw_create_at,_tlw_open,_tlw_free,'\
 '_tlw_add_version,_tlw_get_version,_tlw_get_version_hash,_tlw_get_diff,'\
 '_tlw_version,_tlw_base_version,_tlw_diffs_per_snapshot,'\
+'_tlw_applied_index,_tlw_set_applied_index,'\
 '_tlw_out_ptr,_tlw_out_len,'\
 `# entrylog`\
 '_elw_create_at,_elw_open,_elw_free,'\

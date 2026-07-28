@@ -81,6 +81,13 @@ EMSCRIPTEN_KEEPALIVE int rtw_compact(rtree *t, int dst_fd) {
 EMSCRIPTEN_KEEPALIVE double rtw_size(rtree *t)        { return (double)rtree_size(t); }
 EMSCRIPTEN_KEEPALIVE int    rtw_max_entries(rtree *t) { return rtree_max_entries(t); }
 
+/* Replicated-log integration (see rtree.h): the last applied log index,
+ * staged here and persisted with the next mutation's commit. */
+EMSCRIPTEN_KEEPALIVE double rtw_applied_index(rtree *t) { return (double)rtree_applied_index(t); }
+EMSCRIPTEN_KEEPALIVE int    rtw_set_applied_index(rtree *t, double index) {
+    return rtree_set_applied_index(t, (uint64_t)index);
+}
+
 EMSCRIPTEN_KEEPALIVE rtree_cursor *rtw_cursor_open(rtree *t, double min_lat,
                                                    double max_lat, double min_lng,
                                                    double max_lng) {

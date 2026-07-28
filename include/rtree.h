@@ -48,6 +48,18 @@ void rtree_free(rtree *t);
 /* Accessors (mirror the JS metadata fields). */
 int64_t        rtree_size(const rtree *t);
 int            rtree_max_entries(const rtree *t);
+
+/*
+ * Replicated-log integration: the last log index applied to this tree,
+ * recorded in every commit's metadata so crash-recovery replay knows where
+ * to resume (stage the entry's index before the mutation; the commit
+ * persists both atomically). 0 = not log-driven (field omitted on the wire,
+ * keeping such files byte-identical to the JS reference format). Sticky
+ * once set; never decreases (BJ_ERR_STATE). Restored by open/rewind;
+ * carried through rtree_compact. See bpt_set_applied_index.
+ */
+uint64_t rtree_applied_index(const rtree *t);
+int      rtree_set_applied_index(rtree *t, uint64_t index);
 /* The last search output; writes its length through *len. */
 const uint8_t *rtree_out(const rtree *t, size_t *len);
 

@@ -723,6 +723,25 @@ class BPlusTree {
   }
 
   /**
+   * Last replicated-log index applied to this tree (0 = not log-driven).
+   * Recovered from the file's metadata on open — after a crash, the apply
+   * loop replays committed log entries with index > appliedIndex().
+   */
+  appliedIndex() {
+    return requireModule()._bptw_applied_index(this.ctx);
+  }
+
+  /**
+   * Stage the log index about to be applied; the next mutation's commit
+   * persists it atomically with the mutation (call before add/delete).
+   * Sticky across commits; never decreases; snapshots refuse it.
+   */
+  setAppliedIndex(index) {
+    const rc = requireModule()._bptw_set_applied_index(this.ctx, index);
+    if (rc !== 0) throw codeError(rc, 'setAppliedIndex');
+  }
+
+  /**
    * Wrap a C-side read-only handle as a snapshot object: all read APIs work
    * (search, rangeSearch, toArray, iterate, size, compact), mutations throw.
    * The snapshot shares this tree's file handle without owning it — close
@@ -1076,6 +1095,19 @@ class RTree {
     return this._size === 0;
   }
 
+  /** Last replicated-log index applied to this tree (0 = not log-driven).
+   * See BPlusTree.appliedIndex. */
+  appliedIndex() {
+    return requireModule()._rtw_applied_index(this.ctx);
+  }
+
+  /** Stage the log index about to be applied; persisted atomically with the
+   * next mutation's commit. See BPlusTree.setAppliedIndex. */
+  setAppliedIndex(index) {
+    const rc = requireModule()._rtw_set_applied_index(this.ctx, index);
+    if (rc !== 0) throw codeError(rc, 'setAppliedIndex');
+  }
+
   /**
    * Compact into a fresh file, dropping stale append-only history.
    * @param {FileSystemSyncAccessHandle} destSyncHandle
@@ -1284,6 +1316,21 @@ class TextLog {
   /** Get current version number. */
   getCurrentVersion() {
     return this.version;
+  }
+
+  /** Last replicated-log index applied to this log (0 = not log-driven).
+   * See BPlusTree.appliedIndex. */
+  appliedIndex() {
+    if (!this.isOpen) throw new Error('TextLog is not open');
+    return requireModule()._tlw_applied_index(this.ctx);
+  }
+
+  /** Stage the log index about to be applied; persisted atomically with the
+   * next addVersion's commit. See BPlusTree.setAppliedIndex. */
+  setAppliedIndex(index) {
+    if (!this.isOpen) throw new Error('TextLog is not open');
+    const rc = requireModule()._tlw_set_applied_index(this.ctx, index);
+    if (rc !== 0) throw codeError(rc, 'setAppliedIndex');
   }
 
   /**
@@ -1926,6 +1973,30 @@ class TextIndex {
   async getDocumentCount() {
     this._ensureOpen();
     return this.documentTerms.size();
+  }
+
+  /**
+   * Last replicated-log index applied to this index: the minimum across its
+   * three trees (each records its own in its commit metadata; the journal
+   * keeps them consistent, but a recovery rewind can land them on different
+   * commits — the minimum is the safe replay point).
+   */
+  appliedIndex() {
+    this._ensureOpen();
+    return Math.min(
+      this.index.appliedIndex(),
+      this.documentTerms.appliedIndex(),
+      this.documentLengths.appliedIndex()
+    );
+  }
+
+  /** Stage the log index about to be applied on all three trees; each
+   * tree's next commit persists it. Call before add/remove/clear. */
+  setAppliedIndex(index) {
+    this._ensureOpen();
+    this.index.setAppliedIndex(index);
+    this.documentTerms.setAppliedIndex(index);
+    this.documentLengths.setAppliedIndex(index);
   }
 
   async clear() {

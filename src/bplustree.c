@@ -20,8 +20,13 @@
 #include <math.h>
 
 /* Fixed on-wire size of the metadata object (matches METADATA_SIZE in
- * bplustree.js): 6 fields, all fixed-width INT/POINTER values. */
+ * bplustree.js): 6 fields, all fixed-width INT/POINTER values. A tree driven
+ * by a replicated log carries one extra optional field, appliedIndex
+ * (4-byte key length + 12-byte key + 9-byte INT), written only when nonzero
+ * so legacy files stay byte-identical — metadata is therefore one of two
+ * fixed sizes, and every tail read tries both. */
 #define BPT_METADATA_SIZE 135
+#define BPT_META_APPLIED_EXTRA 25
 
 /* Cap on tree depth while walking file-provided pointers: a corrupt file
  * whose child pointer loops back to an ancestor must error, not recurse
@@ -76,7 +81,10 @@ struct bpt {
     int64_t    size;
     int        order;
     int        min_keys;
-    int        read_only;   /* snapshot handle: mutations disabled */
+    int        read_only;      /* snapshot handle: mutations disabled */
+    uint64_t   applied_index;  /* last log index applied to this tree; 0 =
+                                  not log-driven. Staged by the setter and
+                                  persisted with every metadata write.     */
 };
 
 /* ---- Key helpers ---------------------------------------------------- */
@@ -482,6 +490,13 @@ static int encode_metadata_to(bpt *t, bjfile *dst, uint64_t root,
     bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, size);
     bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, root);
     bj_put_key(b, (const uint8_t *)"nextId", 6);       bj_put_int(b, (int64_t)next_id);
+    /* Written only when the tree is log-driven, so files outside a cluster
+     * stay byte-identical to the JS reference format. Last, to keep the
+     * legacy prefix unchanged. */
+    if (t->applied_index) {
+        bj_put_key(b, (const uint8_t *)"appliedIndex", 12);
+        bj_put_int(b, (int64_t)t->applied_index);
+    }
     bj_end_object(b);
 
     int e = bj_builder_error(b);
@@ -499,7 +514,7 @@ static int save_metadata(bpt *t) {
 }
 
 typedef struct {
-    uint64_t root, next_id;
+    uint64_t root, next_id, applied_index;
     int64_t  size;
     int      order, min_keys;
     int      have_root;
@@ -528,6 +543,7 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, bpt_meta *m) {
         else if (name_eq(kn, klen, "size"))       { if ((e = read_u64(&c, &u))) return e; m->size = (int64_t)u; }
         else if (name_eq(kn, klen, "nextId"))     { if ((e = read_u64(&c, &m->next_id))) return e; }
         else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
+        else if (name_eq(kn, klen, "appliedIndex")) { if ((e = read_u64(&c, &m->applied_index))) return e; }
         else                                      { if ((e = skip_value(&c))) return e; }
     }
     return m->have_root ? BJ_OK : BJ_ERR_STATE;
@@ -549,6 +565,28 @@ static void meta_apply(bpt *t, const bpt_meta *m) {
     t->size = m->size;
     t->next_id = m->next_id;
     t->root = m->root;
+    t->applied_index = m->applied_index;
+}
+
+/* A metadata record ends at `end` in one of two fixed sizes (extended when
+ * the appliedIndex field is present). Read + validate, trying the extended
+ * size first: for a legacy record, end-EXTENDED lands mid-record and cannot
+ * parse as a valid same-length metadata object. */
+static int read_meta_at_end(bpt *t, uint64_t end, bpt_meta *m) {
+    static const size_t sizes[2] = {
+        BPT_METADATA_SIZE + BPT_META_APPLIED_EXTRA, BPT_METADATA_SIZE
+    };
+    for (int i = 0; i < 2; i++) {
+        size_t ms = sizes[i];
+        const uint8_t *rec; size_t rec_len;
+        if (end < ms) continue;
+        if (bjfile_read_record(&t->f, end - ms, &rec, &rec_len)) continue;
+        if (rec_len != ms) continue;
+        if (parse_meta_rec(rec, rec_len, m) != BJ_OK) continue;
+        if (!meta_valid(m, end - ms)) continue;
+        return BJ_OK;
+    }
+    return BJ_ERR_STATE;
 }
 
 /* ---- Insert (mirrors _addToNode / add in bplustree.js) -------------- */
@@ -1556,11 +1594,12 @@ int bpt_reset(bpt *t) {
 }
 
 /* Commit-scan callback: a commit ends at each record that parses and
- * validates as a metadata record of the fixed on-wire size. */
+ * validates as a metadata record of either fixed on-wire size. */
 static int scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
                    size_t rec_len, int *is_commit_end) {
     (void)ctx;
-    if (rec_len == BPT_METADATA_SIZE) {
+    if (rec_len == BPT_METADATA_SIZE ||
+        rec_len == BPT_METADATA_SIZE + BPT_META_APPLIED_EXTRA) {
         bpt_meta m;
         if (parse_meta_rec(rec, rec_len, &m) == BJ_OK && meta_valid(&m, off))
             *is_commit_end = 1;
@@ -1586,28 +1625,26 @@ bpt *bpt_open(const bj_io *io) {
 
     if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
 
-    const uint8_t *md; size_t md_len;
     bpt_meta m;
     uint64_t flen = bjfile_len(&t->f);
-    if (bjfile_check_tail(&t->f, BPT_METADATA_SIZE, &md, &md_len) == BJ_OK &&
-        parse_meta_rec(md, md_len, &m) == BJ_OK &&
-        meta_valid(&m, flen - BPT_METADATA_SIZE)) {
-        meta_apply(t, &m);
-        return t;
+    /* Fast path: verify the tail commit's CRC and adopt its metadata,
+     * trying both metadata sizes (with / without appliedIndex). */
+    for (int i = 0; i < 2; i++) {
+        size_t ms = i ? BPT_METADATA_SIZE
+                      : BPT_METADATA_SIZE + BPT_META_APPLIED_EXTRA;
+        const uint8_t *md; size_t md_len;
+        if (bjfile_check_tail(&t->f, ms, &md, &md_len) == BJ_OK &&
+            parse_meta_rec(md, md_len, &m) == BJ_OK &&
+            meta_valid(&m, flen - ms)) {
+            meta_apply(t, &m);
+            return t;
+        }
     }
 
     /* Recovery. */
     uint64_t good = 0;
     if (bjfile_scan_commits(&t->f, scan_cb, NULL, &good)) { bpt_free(t); return NULL; }
-    if (good < BPT_METADATA_SIZE) { bpt_free(t); return NULL; }
-    const uint8_t *rec; size_t rec_len;
-    if (bjfile_read_record(&t->f, good - BPT_METADATA_SIZE, &rec, &rec_len) ||
-        rec_len != BPT_METADATA_SIZE ||
-        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
-        !meta_valid(&m, good - BPT_METADATA_SIZE)) {
-        bpt_free(t);
-        return NULL;
-    }
+    if (read_meta_at_end(t, good, &m)) { bpt_free(t); return NULL; }
     if (good < flen && bjfile_set_len(&t->f, good)) { bpt_free(t); return NULL; }
     meta_apply(t, &m);
     return t;
@@ -1638,6 +1675,7 @@ bpt *bpt_snapshot(const bpt *t) {
     s->root = t->root;
     s->next_id = t->next_id;
     s->size = t->size;
+    s->applied_index = t->applied_index;
     s->read_only = 1;
     return s;
 }
@@ -1649,13 +1687,8 @@ bpt *bpt_open_at(const bj_io *io, uint64_t len) {
     if (!t->bld) { free(t); return NULL; }
     bjfile_init(&t->f, io);
     if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
-    if (len < BPT_METADATA_SIZE || len > bjfile_len(&t->f)) { bpt_free(t); return NULL; }
-    const uint8_t *rec; size_t rec_len;
     bpt_meta m;
-    if (bjfile_read_record(&t->f, len - BPT_METADATA_SIZE, &rec, &rec_len) ||
-        rec_len != BPT_METADATA_SIZE ||
-        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
-        !meta_valid(&m, len - BPT_METADATA_SIZE)) {
+    if (len > bjfile_len(&t->f) || read_meta_at_end(t, len, &m)) {
         bpt_free(t);
         return NULL;
     }
@@ -1673,7 +1706,8 @@ typedef struct {
 static int boundaries_cb(void *ctx, uint64_t off, const uint8_t *rec,
                          size_t rec_len, int *is_commit_end) {
     bnd_list *bl = (bnd_list *)ctx;
-    if (rec_len != BPT_METADATA_SIZE) return BJ_OK;
+    if (rec_len != BPT_METADATA_SIZE &&
+        rec_len != BPT_METADATA_SIZE + BPT_META_APPLIED_EXTRA) return BJ_OK;
     bpt_meta m;
     if (parse_meta_rec(rec, rec_len, &m) != BJ_OK || !meta_valid(&m, off)) return BJ_OK;
     *is_commit_end = 1;
@@ -1735,15 +1769,11 @@ int bpt_rewind(bpt *t, uint64_t len) {
     if (t->read_only) return BJ_ERR_STATE;
     uint64_t cur = bjfile_len(&t->f);
     if (len == cur) return BJ_OK;
-    if (len > cur || len < BPT_METADATA_SIZE) return BJ_ERR_STATE;
-    const uint8_t *rec; size_t rec_len;
-    int e = bjfile_read_record(&t->f, len - BPT_METADATA_SIZE, &rec, &rec_len);
-    if (e) return e;
+    if (len > cur) return BJ_ERR_STATE;
     bpt_meta m;
-    if (rec_len != BPT_METADATA_SIZE ||
-        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
-        !meta_valid(&m, len - BPT_METADATA_SIZE)) return BJ_ERR_STATE;
-    if ((e = bjfile_set_len(&t->f, len))) return e;
+    if (read_meta_at_end(t, len, &m)) return BJ_ERR_STATE;
+    int e = bjfile_set_len(&t->f, len);
+    if (e) return e;
     meta_apply(t, &m);
     return BJ_OK;
 }
@@ -1752,4 +1782,13 @@ const uint8_t *bpt_out(const bpt *t, size_t *len) { if (len) *len = t->out.len; 
 int64_t        bpt_size(const bpt *t)     { return t->size; }
 uint64_t       bpt_root(const bpt *t)     { return t->root; }
 uint64_t       bpt_next_id(const bpt *t)  { return t->next_id; }
+
+uint64_t bpt_applied_index(const bpt *t)  { return t->applied_index; }
+
+int bpt_set_applied_index(bpt *t, uint64_t index) {
+    if (t->read_only) return BJ_ERR_STATE;
+    if (index < t->applied_index) return BJ_ERR_STATE;   /* never decreases */
+    t->applied_index = index;   /* staged; persisted with the next commit */
+    return BJ_OK;
+}
 int            bpt_order(const bpt *t)    { return t->order; }

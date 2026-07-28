@@ -80,6 +80,21 @@ uint64_t       bpt_root(const bpt *t);
 uint64_t       bpt_next_id(const bpt *t);
 int            bpt_order(const bpt *t);
 
+/*
+ * Replicated-log integration (see entrylog.h): the last log index applied to
+ * this tree, recorded in the metadata record of every commit so a crash-
+ * recovery replay knows where to resume — the apply loop stages the entry's
+ * index (bpt_set_applied_index) before the mutation, and the mutation's
+ * commit persists both atomically. 0 = the tree is not log-driven (the field
+ * is then omitted on the wire, keeping such files byte-identical to the JS
+ * reference format). The staged value is sticky: once set, every later
+ * commit carries it. It never decreases (BJ_ERR_STATE), and snapshots
+ * refuse the setter. Restored by open/open_at/rewind from the adopted
+ * metadata; carried through bpt_compact.
+ */
+uint64_t bpt_applied_index(const bpt *t);
+int      bpt_set_applied_index(bpt *t, uint64_t index);
+
 /* The last search/entries/range/batch output; writes its length through
  * *len. Valid until the next operation on this tree — each tree owns its
  * buffer, so operations on other trees never disturb it. */
@@ -142,8 +157,8 @@ int bpt_reset(bpt *t);
 uint64_t bpt_file_len(const bpt *t);
 /*
  * Truncate the backing file to `len` — which must be a commit boundary
- * (the bytes at len-135 must be a valid metadata record) — and reload the
- * tree's state from it. Because the file is append-only, this atomically
+ * (the file's last bytes before `len` must be a valid metadata record) —
+ * and reload the tree's state from it. Because the file is append-only, this atomically
  * rewinds the tree to the state it had when that commit landed. Used for
  * cross-file transaction rollback (textindex journal).
  */

@@ -89,6 +89,9 @@ static int seed_bpt(dbuf *img) {
     for (int i = 0; i < 40; i++) {
         bpt_key k = num_key(i);
         int e;
+        /* Stage an applied index partway so the image holds commits with
+         * both metadata sizes (legacy and appliedIndex-extended). */
+        if (i == 20) bpt_set_applied_index(t, 1234);
         if (i % 7 == 0) {
             /* Over BPT_OOL_THRESHOLD: exercises out-of-line value storage
              * (and, once mutated, corrupt OOL markers/targets). */
@@ -113,6 +116,7 @@ static int seed_rtree(dbuf *img) {
     for (int i = 0; i < 40; i++) {
         uint8_t oid[12];
         memset(oid, i, sizeof(oid));
+        if (i == 20) rtree_set_applied_index(t, 77);   /* mixed metadata sizes */
         if (rtree_insert(t, (i * 37) % 170 - 85.0, (i * 73) % 350 - 175.0, oid)) break;
     }
     rtree_free(t);
@@ -125,6 +129,7 @@ static int seed_textlog(dbuf *img) {
     if (!t) return -1;
     char text[128];
     for (int i = 0; i < 8; i++) {
+        if (i == 4) textlog_set_applied_index(t, 55);   /* mixed metadata sizes */
         int n = snprintf(text, sizeof(text),
                          "line one v%d\nline two\nline %d\n", i, i * i);
         uint64_t v;
@@ -179,6 +184,7 @@ static void ex_bpt(dbuf *img) {
         for (int g = 0; g < 100000 && bpt_cursor_next(c, &ck, &v, &vl) == 1; g++) {}
         bpt_cursor_close(c);
     }
+    bpt_set_applied_index(t, bpt_applied_index(t) + 1);
     uint8_t val[9] = { 0 };
     bj_builder *b = bj_builder_new();
     if (b) {

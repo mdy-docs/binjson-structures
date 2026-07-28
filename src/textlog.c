@@ -145,6 +145,7 @@ typedef struct {
     int64_t diff_count;
     int diffs_per_snapshot;
     uint64_t base_version;   /* 0 (absent) for a standalone / first tile */
+    uint64_t applied_index;  /* 0 (absent) when not log-driven           */
 } trec;
 
 /* Parse the record bytes (rec, len) into *r. The string fields point into
@@ -182,6 +183,8 @@ static int parse_record(const uint8_t *rec, size_t len, trec *r) {
             r->is_metadata = 1;
         } else if (name_eq(kn, klen, "baseVersion")) {
             if ((e = read_u64(&c, &r->base_version))) return e;
+        } else if (name_eq(kn, klen, "appliedIndex")) {
+            if ((e = read_u64(&c, &r->applied_index))) return e;
         } else {
             if ((e = skip_value(&c))) return e;
         }
@@ -211,6 +214,9 @@ struct textlog {
     int         diffs_per_snapshot;
     int         has_snapshot; uint64_t snapshot_ptr;
     int         has_latest;   uint64_t latest_ptr;
+    uint64_t    applied_index;   /* last log index applied; 0 = not log-
+                                    driven. Staged by the setter, persisted
+                                    with every metadata write.            */
     tl_ent     *ents; int n_ents, cap_ents;   /* entry index            */
     /* Cache of the current version's full text: addVersion used to
      * re-derive (snapshot + diff chain reads) the very text it produced
@@ -280,6 +286,12 @@ static int save_metadata(textlog *t) {
     if (t->base_version) {
         bj_put_key(b, (const uint8_t *)"baseVersion", 11);
         bj_put_int(b, (int64_t)t->base_version);
+    }
+    /* Written only when the log is driven by a replicated log (entrylog.h),
+     * same byte-compat reasoning as baseVersion. */
+    if (t->applied_index) {
+        bj_put_key(b, (const uint8_t *)"appliedIndex", 12);
+        bj_put_int(b, (int64_t)t->applied_index);
     }
     bj_end_object(b);
     int e = bj_builder_error(b);
@@ -620,6 +632,7 @@ textlog *textlog_open(const bj_io *io) {
 
     t->version = adopt->version;
     t->base_version = adopt->base_version;   /* 0 when the field is absent */
+    t->applied_index = adopt->applied_index; /* 0 when the field is absent */
     t->has_snapshot = adopt->has_snap; t->snapshot_ptr = adopt->snap;
     t->has_latest = adopt->has_latest; t->latest_ptr = adopt->latest;
     t->diff_count = adopt->diff_count;
@@ -642,4 +655,12 @@ void textlog_free(textlog *t) {
 uint64_t       textlog_version(const textlog *t)            { return t->version; }
 uint64_t       textlog_base_version(const textlog *t)       { return t->base_version; }
 int            textlog_diffs_per_snapshot(const textlog *t) { return t->diffs_per_snapshot; }
+
+uint64_t textlog_applied_index(const textlog *t)            { return t->applied_index; }
+
+int textlog_set_applied_index(textlog *t, uint64_t index) {
+    if (index < t->applied_index) return BJ_ERR_STATE;   /* never decreases */
+    t->applied_index = index;   /* staged; persisted with the next commit */
+    return BJ_OK;
+}
 const uint8_t *textlog_out(const textlog *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }

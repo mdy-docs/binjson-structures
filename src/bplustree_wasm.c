@@ -155,6 +155,13 @@ EMSCRIPTEN_KEEPALIVE double bptw_root(bpt *t)    { return (double)bpt_root(t); }
 EMSCRIPTEN_KEEPALIVE double bptw_next_id(bpt *t) { return (double)bpt_next_id(t); }
 EMSCRIPTEN_KEEPALIVE int    bptw_order(bpt *t)   { return bpt_order(t); }
 
+/* Replicated-log integration (see bplustree.h): the last applied log index,
+ * staged here and persisted with the next mutation's commit. */
+EMSCRIPTEN_KEEPALIVE double bptw_applied_index(bpt *t) { return (double)bpt_applied_index(t); }
+EMSCRIPTEN_KEEPALIVE int    bptw_set_applied_index(bpt *t, double index) {
+    return bpt_set_applied_index(t, (uint64_t)index);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *bptw_out_ptr(bpt *t) {
     size_t n; return bpt_out(t, &n);
 }

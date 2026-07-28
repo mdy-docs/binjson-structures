@@ -21,8 +21,12 @@
 #include <math.h>
 
 /* Fixed on-wire size of the metadata object (matches METADATA_SIZE in
- * rtree.js): 6 fields, all fixed-width INT/POINTER values. */
+ * rtree.js): 6 fields, all fixed-width INT/POINTER values. A tree driven by
+ * a replicated log carries one extra optional field, appliedIndex, written
+ * only when nonzero (see bplustree.c — same scheme): metadata is one of two
+ * fixed sizes, and every tail read tries both. */
 #define RT_METADATA_SIZE 135
+#define RT_META_APPLIED_EXTRA 25
 
 /* Cap on tree depth while walking file-provided pointers: a corrupt file
  * whose child pointer loops back to an ancestor must error, not recurse
@@ -94,6 +98,9 @@ struct rtree {
     int64_t     size;
     int         max_entries;
     int         min_entries;
+    uint64_t    applied_index;   /* last log index applied; 0 = not log-
+                                    driven. Staged by the setter, persisted
+                                    with every metadata write.             */
 };
 
 static int set_out(rtree *t, const uint8_t *b, size_t n) {
@@ -322,6 +329,13 @@ static int encode_metadata(rtree *t, bjfile *dst, uint64_t root) {
     bj_put_key(b, (const uint8_t *)"size", 4);         bj_put_int(b, t->size);
     bj_put_key(b, (const uint8_t *)"rootPointer", 11); bj_put_pointer(b, root);
     bj_put_key(b, (const uint8_t *)"nextId", 6);       bj_put_int(b, (int64_t)t->next_id);
+    /* Written only when the tree is log-driven, so files outside a cluster
+     * stay byte-identical to the JS reference format. Last, to keep the
+     * legacy prefix unchanged. */
+    if (t->applied_index) {
+        bj_put_key(b, (const uint8_t *)"appliedIndex", 12);
+        bj_put_int(b, (int64_t)t->applied_index);
+    }
     bj_end_object(b);
 
     int e = bj_builder_error(b);
@@ -336,7 +350,7 @@ static int encode_metadata(rtree *t, bjfile *dst, uint64_t root) {
 static int save_metadata(rtree *t) { return encode_metadata(t, &t->f, t->root); }
 
 typedef struct {
-    uint64_t root, next_id;
+    uint64_t root, next_id, applied_index;
     int64_t  size;
     int      max_entries, min_entries;
     int      have_root;
@@ -358,6 +372,7 @@ static int parse_meta_rec(const uint8_t *rec, size_t rec_len, rt_meta *m) {
         else if (name_eq(kn, klen, "size"))       { if ((e = read_u64(&c, &u))) return e; m->size = (int64_t)u; }
         else if (name_eq(kn, klen, "nextId"))     { if ((e = read_u64(&c, &m->next_id))) return e; }
         else if (name_eq(kn, klen, "rootPointer")){ if ((e = read_pointer(&c, &m->root))) return e; m->have_root = 1; }
+        else if (name_eq(kn, klen, "appliedIndex")) { if ((e = read_u64(&c, &m->applied_index))) return e; }
         else                                      { if ((e = skip_value(&c))) return e; }
     }
     return m->have_root ? BJ_OK : BJ_ERR_STATE;
@@ -379,6 +394,27 @@ static void meta_apply(rtree *t, const rt_meta *m) {
     t->size = m->size;
     t->next_id = m->next_id;
     t->root = m->root;
+    t->applied_index = m->applied_index;
+}
+
+/* A metadata record ends at `end` in one of two fixed sizes (extended when
+ * the appliedIndex field is present). Read + validate, trying the extended
+ * size first — mirrors read_meta_at_end in bplustree.c. */
+static int read_meta_at_end(rtree *t, uint64_t end, rt_meta *m) {
+    static const size_t sizes[2] = {
+        RT_METADATA_SIZE + RT_META_APPLIED_EXTRA, RT_METADATA_SIZE
+    };
+    for (int i = 0; i < 2; i++) {
+        size_t ms = sizes[i];
+        const uint8_t *rec; size_t rec_len;
+        if (end < ms) continue;
+        if (bjfile_read_record(&t->f, end - ms, &rec, &rec_len)) continue;
+        if (rec_len != ms) continue;
+        if (parse_meta_rec(rec, rec_len, m) != BJ_OK) continue;
+        if (!meta_valid(m, end - ms)) continue;
+        return BJ_OK;
+    }
+    return BJ_ERR_STATE;
 }
 
 /* ---- Node construction & bbox --------------------------------------- */
@@ -1563,7 +1599,8 @@ rtree *rtree_create(const bj_io *io, int max_entries) {
 static int scan_cb(void *ctx, uint64_t off, const uint8_t *rec,
                    size_t rec_len, int *is_commit_end) {
     (void)ctx;
-    if (rec_len == RT_METADATA_SIZE) {
+    if (rec_len == RT_METADATA_SIZE ||
+        rec_len == RT_METADATA_SIZE + RT_META_APPLIED_EXTRA) {
         rt_meta m;
         if (parse_meta_rec(rec, rec_len, &m) == BJ_OK && meta_valid(&m, off))
             *is_commit_end = 1;
@@ -1588,28 +1625,26 @@ rtree *rtree_open(const bj_io *io) {
 
     if (bjfile_check_header(&t->f, "rtree") < 0) { rtree_free(t); return NULL; }
 
-    const uint8_t *md; size_t md_len;
     rt_meta m;
     uint64_t flen = bjfile_len(&t->f);
-    if (bjfile_check_tail(&t->f, RT_METADATA_SIZE, &md, &md_len) == BJ_OK &&
-        parse_meta_rec(md, md_len, &m) == BJ_OK &&
-        meta_valid(&m, flen - RT_METADATA_SIZE)) {
-        meta_apply(t, &m);
-        return t;
+    /* Fast path: verify the tail commit's CRC and adopt its metadata,
+     * trying both metadata sizes (with / without appliedIndex). */
+    for (int i = 0; i < 2; i++) {
+        size_t ms = i ? RT_METADATA_SIZE
+                      : RT_METADATA_SIZE + RT_META_APPLIED_EXTRA;
+        const uint8_t *md; size_t md_len;
+        if (bjfile_check_tail(&t->f, ms, &md, &md_len) == BJ_OK &&
+            parse_meta_rec(md, md_len, &m) == BJ_OK &&
+            meta_valid(&m, flen - ms)) {
+            meta_apply(t, &m);
+            return t;
+        }
     }
 
     /* Recovery. */
     uint64_t good = 0;
     if (bjfile_scan_commits(&t->f, scan_cb, NULL, &good)) { rtree_free(t); return NULL; }
-    if (good < RT_METADATA_SIZE) { rtree_free(t); return NULL; }
-    const uint8_t *rec; size_t rec_len;
-    if (bjfile_read_record(&t->f, good - RT_METADATA_SIZE, &rec, &rec_len) ||
-        rec_len != RT_METADATA_SIZE ||
-        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
-        !meta_valid(&m, good - RT_METADATA_SIZE)) {
-        rtree_free(t);
-        return NULL;
-    }
+    if (read_meta_at_end(t, good, &m)) { rtree_free(t); return NULL; }
     if (good < flen && bjfile_set_len(&t->f, good)) { rtree_free(t); return NULL; }
     meta_apply(t, &m);
     return t;
@@ -1625,6 +1660,14 @@ void rtree_free(rtree *t) {
 
 int64_t        rtree_size(const rtree *t)        { return t->size; }
 int            rtree_max_entries(const rtree *t) { return t->max_entries; }
+
+uint64_t rtree_applied_index(const rtree *t)     { return t->applied_index; }
+
+int rtree_set_applied_index(rtree *t, uint64_t index) {
+    if (index < t->applied_index) return BJ_ERR_STATE;   /* never decreases */
+    t->applied_index = index;   /* staged; persisted with the next commit */
+    return BJ_OK;
+}
 const uint8_t *rtree_out(const rtree *t, size_t *len)   { if (len) *len = t->out.len; return t->out.data; }
 
 uint64_t rtree_file_len(const rtree *t) { return bjfile_len(&t->f); }
@@ -1632,15 +1675,11 @@ uint64_t rtree_file_len(const rtree *t) { return bjfile_len(&t->f); }
 int rtree_rewind(rtree *t, uint64_t len) {
     uint64_t cur = bjfile_len(&t->f);
     if (len == cur) return BJ_OK;
-    if (len > cur || len < RT_METADATA_SIZE) return BJ_ERR_STATE;
-    const uint8_t *rec; size_t rec_len;
-    int e = bjfile_read_record(&t->f, len - RT_METADATA_SIZE, &rec, &rec_len);
-    if (e) return e;
+    if (len > cur) return BJ_ERR_STATE;
     rt_meta m;
-    if (rec_len != RT_METADATA_SIZE ||
-        parse_meta_rec(rec, rec_len, &m) != BJ_OK ||
-        !meta_valid(&m, len - RT_METADATA_SIZE)) return BJ_ERR_STATE;
-    if ((e = bjfile_set_len(&t->f, len))) return e;
+    if (read_meta_at_end(t, len, &m)) return BJ_ERR_STATE;
+    int e = bjfile_set_len(&t->f, len);
+    if (e) return e;
     meta_apply(t, &m);
     return BJ_OK;
 }

@@ -11,7 +11,11 @@ wire format and file model:
   also a write-ahead log): contiguous term-tagged entries with explicit
   sync-for-durability, durable Raft hard state (currentTerm/votedFor),
   logical suffix truncation (the Raft conflict rule), and snapshot-boundary
-  prefix compaction/tiling.
+  prefix compaction/tiling. The other structures integrate via
+  `appliedIndex`: each records the last log index applied to it in its
+  commit metadata (`setAppliedIndex` before the mutation, persisted
+  atomically with it), so crash-recovery replay knows exactly where to
+  resume per structure.
 
 Split out from the parent `binjson` document-database project (currently
 staged ahead of becoming its own git submodule/repo there — see that
