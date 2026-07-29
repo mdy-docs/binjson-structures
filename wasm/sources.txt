@@ -8,6 +8,7 @@
 src/bjfile.c
 src/bjfile_wasm.c
 src/hostio.c
+src/bjns_bridge.c
 src/bplustree.c
 src/bplustree_wasm.c
 src/keyenc.c
