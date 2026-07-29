@@ -57,7 +57,21 @@ static int32_t mem_trunc(void *ctx, uint64_t len) {
     return 0;
 }
 static bj_io mem_io(dbuf *d) {
-    bj_io io = { d, mem_size, mem_read, mem_write, mem_trunc };
+    /* Designated initializers, not positional: -Wextra's
+     * -Wmissing-field-initializers then reports any bj_io member added
+     * later that this harness has not considered, instead of silently
+     * zero-filling it. For `sync` a zero means "already durable", which is
+     * true for this memory buffer and false for a real file -- so the
+     * warning is worth keeping loud. */
+    bj_io io = {
+        .ctx      = d,
+        .size     = mem_size,
+        .read     = mem_read,
+        .write    = mem_write,
+        .truncate = mem_trunc,
+        .sync     = NULL,   /* memory: writes are durable on return */
+        .close    = NULL,   /* the dbuf outlives every io over it   */
+    };
     return io;
 }
 

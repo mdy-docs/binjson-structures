@@ -205,9 +205,18 @@ static int append_metadata(bjfile *f, bj_builder *b, uint64_t base_index,
  * pending bytes are dropped and the live state rolls back to the committed
  * one, so the memory picture always matches the file.
  */
-static int commit_state(elog *t) {
+/*
+ * `durable` says whether this commit must reach the platter or merely the
+ * host. Every current caller passes 1 -- elog_sync, elog_set_hard_state
+ * and elog_truncate_from are all points Raft may not answer an RPC before
+ * -- and the parameter stays because "which commits are durability points"
+ * is the question this file most needs to keep answering explicitly.
+ * elog_set_commit_index deliberately does not commit at all: it stages,
+ * and rides along with the next sync.
+ */
+static int commit_state(elog *t, int durable) {
     int e = append_metadata(&t->f, t->bld, t->base_index, t->base_term, &t->m);
-    if (!e) e = bjfile_commit(&t->f);
+    if (!e) e = durable ? bjfile_sync(&t->f) : bjfile_commit(&t->f);
     if (e) {
         bjfile_discard(&t->f);
         t->m = t->cm;
@@ -433,7 +442,10 @@ int elog_append(elog *t, uint64_t term, int type,
 }
 
 int elog_sync(elog *t) {
-    return commit_state(t);
+    /* The durability point. Raft's sync-before-ack correctness rests on
+     * this reaching the disk, not just the host's buffer -- see
+     * docs/replicaton-roadmap.md's audit item. */
+    return commit_state(t, 1);
 }
 
 int elog_set_hard_state(elog *t, uint64_t term, uint64_t voted_for) {
@@ -449,7 +461,11 @@ int elog_set_hard_state(elog *t, uint64_t term, uint64_t voted_for) {
         t->m.current_term = term;
         t->m.voted_for = voted_for;   /* a new term resets any previous vote */
     }
-    return commit_state(t);
+    /* Durable, not merely committed: Raft may not answer a RequestVote or
+     * AppendEntries until the term/vote it is about to rely on has reached
+     * the disk. A machine that loses this on a power cut can vote twice in
+     * one term. */
+    return commit_state(t, 1);
 }
 
 int elog_set_commit_index(elog *t, uint64_t index) {
@@ -535,7 +551,9 @@ int elog_truncate_from(elog *t, uint64_t index) {
         ? t->base_term
         : t->ents[index - t->base_index - 2].term;
     t->m.n_ents = (int)(index - 1 - t->base_index);
-    return commit_state(t);
+    /* Durable for the same reason as the hard state: a follower acks an
+     * AppendEntries only after the conflicting suffix is really gone. */
+    return commit_state(t, 1);
 }
 
 int elog_compact(elog *t, const bj_io *dst,

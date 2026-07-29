@@ -51,6 +51,12 @@ static void wr32(uint8_t *p, uint32_t v) {
 }
 
 int bjfile_init(bjfile *f, const bj_io *io) {
+    /* Every file-resident structure funnels through here, so this is the
+     * one place that can refuse an io which cannot honor the durability
+     * contract -- writable with no sync. A no-op unless the build asked
+     * for enforcement (BJIO_REQUIRE_SYNC); see bjio.h. */
+    int e = bjio_check(io);
+    if (e) return e;
     memset(f, 0, sizeof(*f));
     f->io = *io;
     f->flen = io->size(io->ctx);
@@ -114,6 +120,16 @@ int bjfile_commit(bjfile *f) {
     f->wb_len = 0;
     f->crc_committed = f->crc;
     f->crc_len_committed = f->crc_len;
+    return BJ_OK;
+}
+
+int bjfile_sync(bjfile *f) {
+    int e = bjfile_commit(f);
+    if (e) return e;
+    /* No sync callback means the io is already durable on write (memory
+     * backed). A real file adapter without one is rejected at open by
+     * bjio_check under BJIO_REQUIRE_SYNC. */
+    if (f->io.sync) return (int)f->io.sync(f->io.ctx);
     return BJ_OK;
 }
 

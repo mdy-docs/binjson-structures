@@ -1487,7 +1487,10 @@ export function bindStructures(runtime) {
       this._ensureOpen();
       const rc = requireModule()._elw_sync(this.ctx);
       if (rc !== 0) throw codeError(rc, 'sync');
-      this.flush();
+      // No flush() here: elog_sync fsyncs through bj_io.sync itself. This
+      // used to be where durability actually happened, which meant C
+      // declared the durability point and JS provided it -- two owners of
+      // one contract, and a native host got neither.
     }
 
     /**
@@ -1500,7 +1503,7 @@ export function bindStructures(runtime) {
       this._ensureOpen();
       const rc = requireModule()._elw_set_hard_state(this.ctx, term, votedFor);
       if (rc !== 0) throw codeError(rc, 'setHardState');
-      this.flush();
+      // Durable inside elog_set_hard_state -- see the note in sync().
     }
 
     /**
@@ -1577,7 +1580,7 @@ export function bindStructures(runtime) {
       this._ensureOpen();
       const rc = requireModule()._elw_truncate_from(this.ctx, index);
       if (rc !== 0) throw codeError(rc, 'truncateFrom');
-      this.flush();
+      // Durable inside elog_truncate_from -- see the note in sync().
     }
 
     /**

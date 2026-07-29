@@ -85,6 +85,13 @@ uint32_t bjfile_crc32(uint32_t crc, const uint8_t *p, size_t n);
 int bjfile_append(bjfile *f, const uint8_t *b, size_t n, uint64_t *off);
 /* Write all pending appends to the host in one call. */
 int bjfile_commit(bjfile *f);
+/*
+ * Commit pending bytes AND make them durable (bj_io.sync) -- the declared
+ * durability point, distinct from bjfile_commit which only hands bytes to
+ * the host. Callers that must survive a power cut, not merely a process
+ * exit, use this: elog_sync, and the catalog flip in compaction.
+ */
+int bjfile_sync(bjfile *f);
 /* Drop pending appends without writing (failed-operation path). */
 void bjfile_discard(bjfile *f);
 
