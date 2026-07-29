@@ -10,6 +10,8 @@ src/bjfile_wasm.c
 src/hostio.c
 src/bplustree.c
 src/bplustree_wasm.c
+src/keyenc.c
+src/keyenc_wasm.c
 src/geo.c
 src/rtree.c
 src/rtree_wasm.c

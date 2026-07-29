@@ -131,44 +131,73 @@ export function bindStructures(runtime) {
   // ---------------------------------------------------------------------------
 
   /**
+   * Composite-key encoding: marshalling only. The encoding itself lives in
+   * src/keyenc.c (see keyenc.h for the wire shape), which is also what the
+   * document layer calls to key its secondary indexes.
+   *
+   * These three used to be a second, independent implementation of that
+   * encoding in JavaScript -- two encoders that had to agree byte-for-byte
+   * forever, with nothing checking that they did. They now build the key in
+   * C through one shared, reused builder (keyenc_wasm.c's qkw).
+   *
+   * Consequence worth knowing: like everything else in this file, they now
+   * require the module (`await ready()`), where the pure-JS versions did
+   * not.
+   */
+  let keyCtx = 0;
+
+  /** The shared key builder, allocated once, rewound per call. */
+  function keyBuilder(M) {
+    if (!keyCtx) {
+      keyCtx = M._qkw_new();
+      if (!keyCtx) throw codeError(-1, 'qkw_new');   // BJ_ERR_OOM
+    }
+    M._qkw_reset(keyCtx);
+    return keyCtx;
+  }
+
+  /** Append one part. The JS *type* dispatch is genuinely a JS concern -- C
+   *  never sees a JS value -- but every domain rule (NaN has no ordering, a
+   *  string part must not contain U+0000) is C's. */
+  function putKeyPart(M, ctx, value) {
+    let rc;
+    if (typeof value === 'number') {
+      rc = M._qkw_put_number(ctx, value);
+    } else if (typeof value === 'string') {
+      const s = allocStr(M, value);
+      try { rc = M._qkw_put_string(ctx, s.ptr, s.len); } finally { s.free(); }
+    } else {
+      throw new Error(`orderedKey: unsupported part type: ${typeof value}`);
+    }
+    if (rc !== 0) {
+      throw new Error(
+        `orderedKey: ${JSON.stringify(value)} has no order-preserving encoding ` +
+        '(NaN, or a string containing U+0000)'
+      );
+    }
+  }
+
+  /** Copy the built key out of the heap. Re-reads HEAPU8: any of the calls
+   *  above may have grown the heap and swapped the ArrayBuffer. */
+  function takeKey(M, ctx) {
+    const len = M._qkw_len(ctx);
+    check(len < 0 ? len : 0);
+    const ptr = M._qkw_ptr(ctx);
+    return M.HEAPU8.slice(ptr, ptr + len);
+  }
+
+  /**
    * Order-preserving byte encoding of one scalar key part, so the B+ tree's
    * byte-wise (memcmp) key comparison reproduces the value's natural order.
-   * Numbers encode to a 9-byte sequence (a 0x00 tag then a sign-normalized
-   * big-endian IEEE-754 double); strings to a 0x01 tag, their UTF-8 bytes, and a
-   * 0x00 terminator. The number tag sorts before the string tag, matching the
-   * tree's "numbers before strings" rule, and both forms are self-delimiting so
-   * they can be concatenated (see compositeKey). String parts must not contain
-   * U+0000 (reserved as the terminator, matching the engine's NUL convention).
    *
    * @param {number|string} value
    * @returns {Uint8Array}
    */
   function orderedKey(value) {
-    if (typeof value === 'number') {
-      if (Number.isNaN(value)) throw new Error('orderedKey: NaN has no ordering');
-      if (value === 0) value = 0; // normalize -0 to +0 so they compare equal
-      const out = new Uint8Array(9);
-      out[0] = 0x00; // number tag (sorts before strings)
-      const dv = new DataView(out.buffer);
-      dv.setFloat64(1, value, false); // big-endian
-      // Total-order transform: flip the sign bit for positives, all bits for
-      // negatives, so unsigned byte order matches numeric order.
-      if (out[1] & 0x80) { for (let i = 1; i < 9; i++) out[i] ^= 0xff; }
-      else out[1] ^= 0x80;
-      return out;
-    }
-    if (typeof value === 'string') {
-      const body = encoder.encode(value);
-      for (let i = 0; i < body.length; i++) {
-        if (body[i] === 0) throw new Error('orderedKey: string key must not contain U+0000');
-      }
-      const out = new Uint8Array(body.length + 2);
-      out[0] = 0x01; // string tag
-      out.set(body, 1);
-      out[out.length - 1] = 0x00; // terminator keeps prefixes ordered correctly
-      return out;
-    }
-    throw new Error(`orderedKey: unsupported part type: ${typeof value}`);
+    const M = requireModule();
+    const ctx = keyBuilder(M);
+    putKeyPart(M, ctx, value);
+    return takeKey(M, ctx);
   }
 
   /**
@@ -185,13 +214,10 @@ export function bindStructures(runtime) {
    * @returns {Uint8Array}
    */
   function compositeKey(...parts) {
-    const encoded = parts.map(orderedKey);
-    let total = 0;
-    for (const e of encoded) total += e.length;
-    const out = new Uint8Array(total);
-    let at = 0;
-    for (const e of encoded) { out.set(e, at); at += e.length; }
-    return out;
+    const M = requireModule();
+    const ctx = keyBuilder(M);
+    for (const part of parts) putKeyPart(M, ctx, part);
+    return takeKey(M, ctx);
   }
 
   /**
@@ -206,11 +232,11 @@ export function bindStructures(runtime) {
    * @returns {Uint8Array}
    */
   function compositeUpperBound(...parts) {
-    const prefix = compositeKey(...parts);
-    const out = new Uint8Array(prefix.length + 1);
-    out.set(prefix, 0);
-    out[prefix.length] = 0xff;
-    return out;
+    const M = requireModule();
+    const ctx = keyBuilder(M);
+    for (const part of parts) putKeyPart(M, ctx, part);
+    check(M._qkw_put_upper_bound(ctx));
+    return takeKey(M, ctx);
   }
 
   /**

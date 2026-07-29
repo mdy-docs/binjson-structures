@@ -37,6 +37,16 @@ _bptw_set_applied_index
 _bptw_out_ptr
 _bptw_out_len
 
+# keyenc (composite/secondary-index key encoding)
+_qkw_new
+_qkw_free
+_qkw_reset
+_qkw_put_number
+_qkw_put_string
+_qkw_put_upper_bound
+_qkw_ptr
+_qkw_len
+
 # rtree
 _rtw_create
 _rtw_open
