@@ -51,13 +51,18 @@ static void wr32(uint8_t *p, uint32_t v) {
 }
 
 int bjfile_init(bjfile *f, const bj_io *io) {
+    /* Zero BEFORE the check, not after. A caller whose io is refused still
+     * owns `f` and will hand it to bjfile_dispose on the way out, so it
+     * has to be in a defined state on the failure path too -- and leaving
+     * f->io holding whatever was on the caller's stack means the next
+     * f->io.write() is a jump into it. */
+    memset(f, 0, sizeof(*f));
     /* Every file-resident structure funnels through here, so this is the
      * one place that can refuse an io which cannot honor the durability
      * contract -- writable with no sync. A no-op unless the build asked
      * for enforcement (BJIO_REQUIRE_SYNC); see bjio.h. */
     int e = bjio_check(io);
     if (e) return e;
-    memset(f, 0, sizeof(*f));
     f->io = *io;
     f->flen = io->size(io->ctx);
     f->rd_hint = BJFILE_RD_HINT0;

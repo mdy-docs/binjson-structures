@@ -69,8 +69,24 @@ typedef struct bjfile {
     uint64_t crc_len_committed;          /*   restored by bjfile_discard     */
 } bjfile;
 
-/* Bind `f` to `io` and capture the current file size. Returns BJ_OK. */
-int bjfile_init(bjfile *f, const bj_io *io);
+/*
+ * Bind `f` to `io` and capture the current file size. Returns BJ_OK, or
+ * BJ_ERR_STATE when bjio_check refuses the io -- writable with no sync
+ * under BJIO_REQUIRE_SYNC. `f` is zeroed either way, so a caller that
+ * bails may still bjfile_dispose it.
+ *
+ * warn_unused_result is not decoration. Twelve of the thirteen call sites
+ * in this library dropped the result, which meant bjio_check -- whose
+ * entire job is to "fail loudly on the first open" -- failed silently and
+ * left the structure holding a zeroed vtable, so the loud failure arrived
+ * later as a call through a null function pointer. Under wasm that is an
+ * immediate trap; natively it is worse.
+ */
+int bjfile_init(bjfile *f, const bj_io *io)
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((warn_unused_result))
+#endif
+    ;
 /* Release buffers (does not touch the file). */
 void bjfile_dispose(bjfile *f);
 

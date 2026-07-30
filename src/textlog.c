@@ -535,7 +535,7 @@ textlog *textlog_create_at(const bj_io *io, int diffs_per_snapshot,
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { textlog_free(t); return NULL; }
     /* A fresh tile owns global versions (base_version, ...]: the first
      * addVersion produces base_version + 1, and because has_latest is 0 it is
      * forced to be a full snapshot — so the tile is self-contained without
@@ -604,7 +604,7 @@ textlog *textlog_open(const bj_io *io) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { textlog_free(t); return NULL; }
 
     if (bjfile_check_header(&t->f, "textlog") < 0) { textlog_free(t); return NULL; }
 

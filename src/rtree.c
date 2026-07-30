@@ -1552,7 +1552,8 @@ static int clone_node(rtree *t, bjfile *dst, ptrmap *m, uint64_t old_off,
 
 int rtree_compact(rtree *t, const bj_io *dst_io) {
     bjfile dst;
-    bjfile_init(&dst, dst_io);
+    int ie = bjfile_init(&dst, dst_io);
+    if (ie) return ie;
     dst.autoflush = 1u << 18;   /* stream to the host in ~256 KB chunks */
     ptrmap m; memset(&m, 0, sizeof(m));
     uint64_t new_root = 0;
@@ -1578,7 +1579,7 @@ rtree *rtree_create(const bj_io *io, int max_entries) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { rtree_free(t); return NULL; }
     t->max_entries = max_entries;
     t->min_entries = min_entries_for(max_entries);
     t->next_id = 1;
@@ -1621,7 +1622,7 @@ rtree *rtree_open(const bj_io *io) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { rtree_free(t); return NULL; }
 
     if (bjfile_check_header(&t->f, "rtree") < 0) { rtree_free(t); return NULL; }
 

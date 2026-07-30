@@ -1536,7 +1536,8 @@ int bpt_sync(bpt *t) {
 
 int bpt_compact(bpt *t, const bj_io *dst_io) {
     bjfile dst;
-    bjfile_init(&dst, dst_io);
+    int ie = bjfile_init(&dst, dst_io);
+    if (ie) return ie;
     dst.autoflush = 1u << 18;   /* stream to the host in ~256 KB chunks */
     bulk_loader bl;
     memset(&bl, 0, sizeof(bl));
@@ -1583,7 +1584,7 @@ bpt *bpt_create(const bj_io *io, int order) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { bpt_free(t); return NULL; }
     t->order = order;
     t->min_keys = (order + 1) / 2 - 1;   /* ceil(order/2) - 1 */
     if (init_empty(t)) { bpt_free(t); return NULL; }
@@ -1625,7 +1626,7 @@ bpt *bpt_open(const bj_io *io) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { bpt_free(t); return NULL; }
 
     if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
 
@@ -1673,7 +1674,7 @@ bpt *bpt_snapshot(const bpt *t) {
     if (!s) return NULL;
     s->bld = bj_builder_new();
     if (!s->bld) { free(s); return NULL; }
-    bjfile_init(&s->f, &t->f.io);
+    if (bjfile_init(&s->f, &t->f.io)) { bpt_free(s); return NULL; }
     s->order = t->order;
     s->min_keys = t->min_keys;
     s->root = t->root;
@@ -1689,7 +1690,7 @@ bpt *bpt_open_at(const bj_io *io, uint64_t len) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { bpt_free(t); return NULL; }
     if (bjfile_check_header(&t->f, "bplustree") < 0) { bpt_free(t); return NULL; }
     bpt_meta m;
     if (len > bjfile_len(&t->f) || read_meta_at_end(t, len, &m)) {

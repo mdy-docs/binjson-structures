@@ -40,7 +40,9 @@ typedef struct bj_io {
      * true for a memory-backed io and is NEVER true for a real file, so a
      * file-backed adapter that leaves this NULL is silently not durable.
      * bjio_check exists to catch exactly that; build with
-     * -DBJIO_REQUIRE_SYNC (the native and WASI builds do) to enforce it.
+     * -DBJIO_REQUIRE_SYNC to enforce it. A shipping server binary should;
+     * the test harnesses must not, because they run on memory-backed ios
+     * whose NULL sync is correct.
      *
      * Deliberately NOT called by bjfile_commit: every append commits, and
      * fsyncing every B+ tree insert would be a different database. It is

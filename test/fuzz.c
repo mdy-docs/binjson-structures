@@ -26,8 +26,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
 #include <unistd.h>
+
+/*
+ * The hang watchdog is a SIGALRM, and wasm has no signals at all -- the
+ * wasi-sdk header refuses to compile rather than pretend. So under WASI
+ * the watchdog compiles away and a hang is a hang: the runner's own
+ * timeout catches it, one level up, with a less precise message. Every
+ * other check in this file is unaffected, which is the point of building
+ * here -- wasm32 does the same arithmetic on half-width pointers, so an
+ * overflow the 64-bit run cannot reach is exactly what this finds.
+ */
+#ifdef __wasi__
+#define fuzz_watchdog(seconds) ((void)0)
+#else
+#include <signal.h>
+#define fuzz_watchdog(seconds) alarm(seconds)
+#endif
 
 /* ---- Memory-backed bj_io over a dbuf --------------------------------- */
 
@@ -388,12 +403,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 static uint64_t cur_iter, cur_seed;
 static int cur_which;
 
+#ifndef __wasi__
 static void on_alarm(int sig) {
     (void)sig;
     fprintf(stderr, "\nHANG: structure %d, iteration %llu, seed %llu\n",
             cur_which, (unsigned long long)cur_iter, (unsigned long long)cur_seed);
     _exit(3);
 }
+#endif
 
 int main(int argc, char **argv) {
     uint64_t iters = argc > 1 ? strtoull(argv[1], NULL, 10) : 20000;
@@ -406,15 +423,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "seed construction failed\n");
         return 2;
     }
+#ifndef __wasi__
     signal(SIGALRM, on_alarm);
+#endif
 
     /* Sanity: every structure must handle its own unmutated seed. */
     for (int w = 0; w < 5; w++) {
         dbuf img; memset(&img, 0, sizeof(img));
         if (dbuf_put(&img, seeds[seed_for(w)].data, seeds[seed_for(w)].len)) return 2;
-        alarm(20);
+        fuzz_watchdog(20);
         run_one(w, &img);
-        alarm(0);
+        fuzz_watchdog(0);
         dbuf_free(&img);
     }
 
@@ -428,9 +447,9 @@ int main(int argc, char **argv) {
         dbuf img; memset(&img, 0, sizeof(img));
         if (dbuf_put(&img, src->data, src->len)) return 2;
         mutate(&img);
-        alarm(20);
+        fuzz_watchdog(20);
         run_one(cur_which, &img);
-        alarm(0);
+        fuzz_watchdog(0);
         dbuf_free(&img);
 
         if ((i + 1) % 10000 == 0)

@@ -233,7 +233,7 @@ elog *elog_create_at(const bj_io *io, uint64_t base_index, uint64_t base_term) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { elog_free(t); return NULL; }
     t->base_index = base_index;
     t->base_term = base_term;
     /* A fresh tile owns (base, ...]: empty, with last == base. Entries at or
@@ -317,7 +317,7 @@ elog *elog_open(const bj_io *io) {
     if (!t) return NULL;
     t->bld = bj_builder_new();
     if (!t->bld) { free(t); return NULL; }
-    bjfile_init(&t->f, io);
+    if (bjfile_init(&t->f, io)) { elog_free(t); return NULL; }
 
     if (bjfile_check_header(&t->f, "entrylog") < 0) { elog_free(t); return NULL; }
 
