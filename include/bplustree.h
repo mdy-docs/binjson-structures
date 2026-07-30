@@ -172,6 +172,17 @@ int bpt_rewind(bpt *t, uint64_t len);
  */
 int bpt_compact(bpt *t, const bj_io *dst);
 
+/*
+ * Make this tree's committed bytes durable (bj_io.sync). Every mutation
+ * already commits -- hands its bytes to the host -- so this is only for
+ * the points where surviving a power cut matters rather than surviving a
+ * process exit: the catalog flip that adopts a compacted generation is
+ * the one that must not be lost after the old files are deleted.
+ *
+ * A no-op on a memory-backed io, which has nothing to make durable.
+ */
+int bpt_sync(bpt *t);
+
 /* ---- Snapshots (MVCC) -------------------------------------------------- */
 
 /*

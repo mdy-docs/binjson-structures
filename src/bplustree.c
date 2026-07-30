@@ -1530,6 +1530,10 @@ static int compact_walk(bpt *t, uint64_t ptr, bulk_loader *bl, int depth) {
     return e;
 }
 
+int bpt_sync(bpt *t) {
+    return bjfile_sync(&t->f);
+}
+
 int bpt_compact(bpt *t, const bj_io *dst_io) {
     bjfile dst;
     bjfile_init(&dst, dst_io);
