@@ -21,6 +21,8 @@ src/textlog.c
 src/textlog_wasm.c
 src/entrylog.c
 src/entrylog_wasm.c
+src/snapstore.c
+src/snapstore_wasm.c
 src/stemmer.c
 src/textindex.c
 src/textindex_wasm.c

@@ -85,6 +85,14 @@ export function bindStructures(runtime) {
     return { ptr, len, free() { M._free(ptr); } };
   }
 
+  /** Copy `bytes` into the heap, call fn(ptr, len), then free. */
+  function withBytes(M, bytes, fn) {
+    const n = bytes.length;
+    const ptr = M._malloc(n || 1);
+    if (n) M.HEAPU8.set(bytes, ptr);
+    try { return fn(ptr, n); } finally { M._free(ptr); }
+  }
+
   /** Little-endian u32 read from the heap (HEAPU32 isn't exported). */
   function readU32(M, addr) {
     const b = M.HEAPU8;
@@ -1660,6 +1668,55 @@ export function bindStructures(runtime) {
     return crc;
   }
 
+  let checkCtx = 0;
+
+  /**
+   * Do these measured files match what a manifest promised?
+   *
+   * `actual` and `expected` are both [{ role, size, crc }] (`expected`
+   * may carry more fields, e.g. a local manifest's `name`). Every
+   * expected role must appear in `actual` and agree on BOTH size and
+   * crc; a role that never arrived counts as a mismatch, because an
+   * install missing a structure has not received the snapshot. Throws
+   * naming the first offending role.
+   *
+   * Standalone, not a SnapshotStore method, because the third caller has
+   * no store: test/raft-harness.js's in-memory snapshotter validates a
+   * transferred snapshot with no files anywhere. It had its own copy of
+   * this rule, as did the replicated install path and the store's
+   * verify() -- and an independent implementation of a checksum rule is
+   * not a second opinion worth having. A harness laxer than production
+   * passes what production would reject.
+   *
+   * The comparison itself is C's (snapstore.h, sst_check_files); this is
+   * marshalling.
+   */
+  function snapshotCheckFiles(actual, expected) {
+    const M = requireModule();
+    if (!checkCtx) {
+      // Prefix-less: this context is used only for the comparison and
+      // its output slot, never to name a file.
+      checkCtx = M._sstw_new(0, 0);
+      if (!checkCtx) throw codeError(-1, 'sstw_new');
+    }
+    const record = encode({ files: expected });
+    const a = encode(actual);
+    const rp = M._malloc(record.length || 1);
+    const ap = M._malloc(a.length || 1);
+    try {
+      if (record.length) M.HEAPU8.set(record, rp);
+      if (a.length) M.HEAPU8.set(a, ap);
+      const rc = M._sstw_check_files(checkCtx, rp, record.length, ap, a.length);
+      if (rc !== 0) {
+        const ptr = M._sstw_out_ptr(checkCtx);
+        const len = M._sstw_out_len(checkCtx);
+        const role = len ? decoder.decode(M.HEAPU8.slice(ptr, ptr + len)) : '?';
+        throw new Error(`Snapshot file ${role} failed its checksum`);
+      }
+    } finally { M._free(ap); M._free(rp); }
+    return true;
+  }
+
   /**
    * Crash-safe storage for Raft state-machine snapshots (and the compacted
    * entry-log files that pair with them), built on a naming convention
@@ -1713,12 +1770,47 @@ export function bindStructures(runtime) {
       this.prefix = prefix;
       this.isOpen = false;
       this._latest = null;
-      this._nextGen = 1;
+      this._ctx = 0;    // the C store (snapstore.h), created on open()
     }
 
-    _manifestName(gen) { return `${this.prefix}-${gen}.manifest.bj`; }
-    _dataName(gen, role) { return `${this.prefix}-${gen}-${role}.bj`; }
-    _logName(gen) { return `${this.prefix}-log-${gen}.bj`; }
+    /**
+     * Call `fn(M, ctx)` and return the store's output buffer as bytes.
+     * Every C call here writes its answer -- a filename, a plan, an
+     * encoded manifest -- into that one slot.
+     */
+    _call(fn, context) {
+      const M = requireModule();
+      const rc = fn(M, this._ctx);
+      if (rc !== 0) throw codeError(rc, context);
+      const ptr = M._sstw_out_ptr(this._ctx);
+      const len = M._sstw_out_len(this._ctx);
+      return len ? M.HEAPU8.slice(ptr, ptr + len) : new Uint8Array(0);
+    }
+
+    _text(fn, context) { return decoder.decode(this._call(fn, context)); }
+
+    /** NUL-separated names, as every plan in snapstore.h emits them. */
+    _names(fn, context) {
+      const s = this._text(fn, context);
+      return s ? s.split('\0').filter(Boolean) : [];
+    }
+
+    _withStr(str, fn, context) {
+      const M = requireModule();
+      const a = allocStr(M, str);
+      try { return fn(M, a); } finally { a.free(); }
+    }
+
+    _manifestName(gen) {
+      return this._text((M, c) => M._sstw_manifest_name(c, gen), 'manifest name');
+    }
+    _dataName(gen, role) {
+      return this._withStr(role, (M, a) =>
+        this._text((MM, c) => MM._sstw_data_name(c, gen, a.ptr, a.len), `role ${role}`));
+    }
+    _logName(gen) {
+      return this._text((M, c) => M._sstw_log_name(c, gen), 'log name');
+    }
 
     async _sync(name, create = false) {
       const fh = await this.dir.getFileHandle(name, { create });
@@ -1749,90 +1841,89 @@ export function bindStructures(runtime) {
       }
     }
 
-    /** Parse + validate a manifest file; null if torn/corrupt/misshapen. */
-    async _loadManifest(name) {
-      let bytes;
+    /** Every name in the directory, NUL-separated, as C consumes it. */
+    async _listing() {
+      const names = [];
+      for await (const [name] of this.dir.entries()) names.push(name);
+      return encoder.encode(names.length ? names.join('\0') + '\0' : '');
+    }
+
+    /** A file's length, or -1 if it cannot be opened at all. */
+    async _sizeOf(name) {
       try {
         const h = await this._sync(name);
-        bytes = new Uint8Array(h.getSize());
-        if (bytes.length) h.read(bytes, { at: 0 });
-        await h.close();
-      } catch (e) {
-        return null;
-      }
-      if (bytes.length < 5) return null;
-      const body = bytes.subarray(0, bytes.length - 4);
-      const want = new DataView(bytes.buffer, bytes.byteOffset + body.length, 4).getUint32(0, true);
-      if (crc32(body) !== want) return null;
-      let m;
-      try { m = decode(body); } catch (e) { return null; }
-      if (!m || m.snapshot !== 1 || !Array.isArray(m.files)) return null;
-      if (typeof m.lastIncludedIndex !== 'number' || typeof m.lastIncludedTerm !== 'number') return null;
-      for (const f of m.files) {
-        if (typeof f.role !== 'string' || typeof f.name !== 'string' ||
-            typeof f.size !== 'number' || typeof f.crc !== 'number') return null;
-      }
-      return m;
+        try { return h.getSize(); } finally { await h.close(); }
+      } catch (e) { return -1; }
     }
 
     /**
-     * Scan the directory, adopt the newest valid generation (manifest
-     * validates, every file present at its recorded size), and sweep the
-     * files of every other generation — crashed attempts and superseded
+     * Scan the directory, adopt the newest valid generation, and sweep the
+     * files of every other generation -- crashed attempts and superseded
      * snapshots alike. Log files are untouched (see pruneLogs).
+     *
+     * The body is snapstore.h's two-beat trampoline: C decides which
+     * generations exist and in what order to try them, this side does the
+     * awaiting. Every rule about what makes a generation adoptable -- the
+     * manifest's CRC, its shape, whether its files are present at their
+     * recorded lengths -- is in sst_try_manifest/sst_confirm, so a host
+     * that cannot open files asynchronously runs the identical policy
+     * through a loop that never suspends.
      */
     async open() {
       if (this.isOpen) throw new Error('SnapshotStore is already open');
       await ready();
+      const M = requireModule();
 
-      const manifestRe = new RegExp(`^${this.prefix}-(\\d+)\\.manifest\\.bj$`);
-      const dataRe = new RegExp(`^${this.prefix}-(\\d+)-([A-Za-z0-9_-]+)\\.bj$`);
-      const logRe = new RegExp(`^${this.prefix}-log-(\\d+)\\.bj$`);
+      const p = allocStr(M, this.prefix);
+      try {
+        this._ctx = M._sstw_new(p.ptr, p.len);
+      } finally { p.free(); }
+      if (!this._ctx) throw codeError(-1, 'sstw_new');
 
-      const gens = new Map();   // gen -> { manifestName, files: Map(role -> name) }
-      const at = (gen) => {
-        let g = gens.get(gen);
-        if (!g) { g = { manifestName: null, files: new Map() }; gens.set(gen, g); }
-        return g;
-      };
-      let maxGen = 0;
-      for await (const [name] of this.dir.entries()) {
-        let m;
-        if ((m = name.match(manifestRe))) at(Number(m[1])).manifestName = name;
-        else if ((m = name.match(dataRe))) at(Number(m[1])).files.set(m[2], name);
-        else if ((m = name.match(logRe))) { /* separate lifecycle */ }
-        else continue;
-        if (m[1] !== undefined) maxGen = Math.max(maxGen, Number(m[1]) || 0);
-      }
+      const listing = await this._listing();
+      this._call((MM, c) => withBytes(MM, listing, (ptr, len) => MM._sstw_scan(c, ptr, len)), 'scan');
 
-      let adopted = null;
-      for (const gen of [...gens.keys()].sort((a, b) => b - a)) {
-        const g = gens.get(gen);
-        if (!g.manifestName) continue;
-        const meta = await this._loadManifest(g.manifestName);
-        if (!meta) continue;
-        let ok = true;
-        for (const f of meta.files) {
-          if (g.files.get(f.role) !== f.name || f.name !== this._dataName(gen, f.role)) { ok = false; break; }
-          try {
-            const h = await this._sync(f.name);
-            const size = h.getSize();
-            await h.close();
-            if (size !== f.size) { ok = false; break; }
-          } catch (e) { ok = false; break; }
+      const count = M._sstw_candidate_count(this._ctx);
+      for (let i = 0; i < count; i++) {
+        const manifestName = this._text((MM, c) => MM._sstw_candidate_manifest(c, i), 'candidate');
+        let bytes;
+        try {
+          const h = await this._sync(manifestName);
+          bytes = new Uint8Array(h.getSize());
+          if (bytes.length) h.read(bytes, { at: 0 });
+          await h.close();
+        } catch (e) { continue; }   // vanished under us: try the next
+
+        const MM = requireModule();
+        if (withBytes(MM, bytes, (ptr, len) => MM._sstw_try_manifest(this._ctx, i, ptr, len)) !== 0) continue;
+
+        // Beat two: only this candidate's files get opened.
+        const pending = MM._sstw_pending_count(this._ctx);
+        const sizes = new Float64Array(pending);
+        for (let k = 0; k < pending; k++) {
+          sizes[k] = await this._sizeOf(this._text((M3, c) => M3._sstw_pending_name(c, k), 'pending'));
         }
-        if (ok) { adopted = { gen, ...meta }; break; }
+        const M4 = requireModule();
+        const sp = M4._malloc(pending * 8 || 1);
+        let ok;
+        try {
+          if (pending) M4.HEAPU8.set(new Uint8Array(sizes.buffer), sp);
+          ok = M4._sstw_confirm(this._ctx, sp, pending) === 0;
+        } finally { M4._free(sp); }
+        if (ok) break;
       }
 
-      for (const [gen, g] of gens) {
-        if (adopted && gen === adopted.gen) continue;
-        if (g.manifestName) await this._remove(g.manifestName);
-        for (const name of g.files.values()) await this._remove(name);
+      for (const name of this._names((MM, c) => MM._sstw_sweep_plan(c), 'sweep')) {
+        await this._remove(name);
       }
 
-      this._latest = adopted;
-      this._nextGen = maxGen + 1;
+      this._latest = this._readLatest();
       this.isOpen = true;
+    }
+
+    _readLatest() {
+      const bytes = this._call((M, c) => M._sstw_latest(c), 'latest');
+      return bytes.length ? decode(bytes) : null;
     }
 
     /** The adopted snapshot: { gen, lastIncludedIndex, lastIncludedTerm,
@@ -1845,6 +1936,15 @@ export function bindStructures(runtime) {
       if (!this.isOpen) throw new Error('SnapshotStore is not open');
     }
 
+    /** Release the C store. Idempotent; the store is unusable afterwards. */
+    close() {
+      if (this._ctx) {
+        requireModule()._sstw_free(this._ctx);
+        this._ctx = 0;
+      }
+      this.isOpen = false;
+    }
+
     /**
      * Start writing a new generation. Write each structure into
      * tx.createFile(role) (e.g. via compact(), which closes the handle),
@@ -1854,13 +1954,16 @@ export function bindStructures(runtime) {
      */
     async begin() {
       this._ensureOpen();
-      const gen = this._nextGen++;
+      const M = requireModule();
+      const gen = M._sstw_next_gen(this._ctx);
       const created = new Map();   // role -> name
       const store = this;
       return {
         gen,
         async createFile(role) {
-          if (!/^[A-Za-z0-9_-]+$/.test(role)) throw new Error(`Invalid snapshot role: ${role}`);
+          // sst_data_name rejects a role that cannot be a filename; the
+          // duplicate check is here because a Map is where duplicates are
+          // visible, and C sees only one role at a time until commit.
           if (created.has(role)) throw new Error(`Duplicate snapshot role: ${role}`);
           const name = store._dataName(gen, role);
           created.set(role, name);
@@ -1872,22 +1975,37 @@ export function bindStructures(runtime) {
             const { size, crc } = await store._crcOfFile(name);
             files.push({ role, name, size, crc });
           }
-          const body = encode({ snapshot: 1, lastIncludedIndex, lastIncludedTerm, config, files });
-          const out = new Uint8Array(body.length + 4);
-          out.set(body, 0);
-          new DataView(out.buffer).setUint32(body.length, crc32(body), true);
+          // The record AND its trailing CRC come from C: writing this
+          // file is the commit point, so what counts as a valid manifest
+          // must have exactly one definition (snapstore.h).
+          const out = store._call((MM, c) => {
+            const f = encode(files);
+            const cfg = config === null ? new Uint8Array(0) : encode(config);
+            const fp = MM._malloc(f.length || 1);
+            const cp = MM._malloc(cfg.length || 1);
+            try {
+              if (f.length) MM.HEAPU8.set(f, fp);
+              if (cfg.length) MM.HEAPU8.set(cfg, cp);
+              return MM._sstw_manifest_encode(c, lastIncludedIndex, lastIncludedTerm,
+                                              cp, cfg.length, fp, f.length);
+            } finally { MM._free(cp); MM._free(fp); }
+          }, 'manifest');
+
           const h = await store._sync(store._manifestName(gen), true);
           h.truncate(0);
           h.write(out, { at: 0 });
           h.flush();
           await h.close();
 
-          const prev = store._latest;
-          store._latest = { gen, lastIncludedIndex, lastIncludedTerm, config, files };
-          if (prev) {
-            await store._remove(store._manifestName(prev.gen));
-            for (const f of prev.files) await store._remove(f.name);
-          }
+          // Only now is the predecessor obsolete -- C hands back its
+          // files, so the sweep rule is the one open() uses rather than a
+          // second reading of the same idea here.
+          const sweep = store._names(
+            (MM, c) => withBytes(MM, out, (ptr, len) => MM._sstw_adopt_committed(c, gen, ptr, len)),
+            'commit'
+          );
+          store._latest = store._readLatest();
+          for (const name of sweep) await store._remove(name);
           return store._latest;
         },
         async abort() {
@@ -1897,23 +2015,27 @@ export function bindStructures(runtime) {
       };
     }
 
-    /** Open a role file of the adopted snapshot for reading (e.g. to serve
-     * InstallSnapshot chunks). Caller closes the handle. */
-    async openFile(role) {
+    _fileForRole(role) {
       this._ensureOpen();
       if (!this._latest) throw new Error('No snapshot to open');
       const f = this._latest.files.find((x) => x.role === role);
       if (!f) throw new Error(`No snapshot file for role: ${role}`);
-      return this._sync(f.name);
+      return f;
+    }
+
+    /** Open a role file of the adopted snapshot for reading (e.g. to serve
+     * InstallSnapshot chunks). Caller closes the handle. */
+    async openFile(role) {
+      return this._sync(this._fileForRole(role).name);
     }
 
     /** Stream-copy a role file of the adopted snapshot into `destSyncHandle`
      * (the database's live filename after an install). Closes the
      * destination handle; verifies the copied bytes against the manifest CRC. */
     async copyFile(role, destSyncHandle) {
-      const src = await this.openFile(role);
+      const f = this._fileForRole(role);
+      const src = await this._sync(f.name);
       try {
-        const f = this._latest.files.find((x) => x.role === role);
         const CH = 65536;
         const buf = new Uint8Array(Math.min(CH, f.size) || 1);
         let crc = 0;
@@ -1925,7 +2047,7 @@ export function bindStructures(runtime) {
           crc = crc32(view, crc);
           destSyncHandle.write(view, { at });
         }
-        if (crc !== f.crc) throw new Error(`Snapshot file ${f.name} failed its checksum`);
+        this.checkFiles([{ role, size: f.size, crc }], [f]);
         destSyncHandle.flush();
       } finally {
         await src.close();
@@ -1933,18 +2055,47 @@ export function bindStructures(runtime) {
       }
     }
 
+    /**
+     * Check measured (size, crc) pairs against a manifest -- the adopted
+     * one by default, or a leader's during an install.
+     *
+     * Every caller that decides whether a set of bytes IS a snapshot goes
+     * through here: verify() below, copyFile above, and the replicated
+     * install path in src/db-replicated.js. They each used to carry their
+     * own copy of the comparison, which is three chances to disagree
+     * about whether a follower may adopt what it was sent.
+     *
+     * `actual` is [{ role, size, crc }]. `expected` defaults to the
+     * adopted manifest's files; an install passes the leader's, and
+     * copyFile passes the single entry it just copied. Every expected
+     * role must appear in `actual` and match on both fields -- absence
+     * counts as a mismatch, because an install missing a structure has
+     * not received the snapshot.
+     *
+     * Throws naming the first role that does not match; returns true
+     * otherwise.
+     */
+    checkFiles(actual, expected = null) {
+      this._ensureOpen();
+      return snapshotCheckFiles(actual, expected ?? this._latest?.files ?? []);
+    }
+
     /** Re-checksum every file of the adopted snapshot against the manifest.
      * Returns true, or throws naming the corrupt file. O(total bytes). */
     async verify() {
       this._ensureOpen();
       if (!this._latest) throw new Error('No snapshot to verify');
+      const actual = [];
       for (const f of this._latest.files) {
-        const { size, crc } = await this._crcOfFile(f.name);
-        if (size !== f.size || crc !== f.crc) {
-          throw new Error(`Snapshot file ${f.name} failed its checksum`);
-        }
+        // A file that will not open at all is reported as a mismatch by
+        // the same rule everything else is, rather than as a raw I/O
+        // exception the install path would have to special-case.
+        try {
+          const { size, crc } = await this._crcOfFile(f.name);
+          actual.push({ role: f.role, size, crc });
+        } catch (e) { actual.push({ role: f.role, size: -1, crc: 0 }); }
       }
-      return true;
+      return this.checkFiles(actual);
     }
 
     /**
@@ -1965,22 +2116,24 @@ export function bindStructures(runtime) {
      * durable). */
     async logCandidates() {
       this._ensureOpen();
-      const logRe = new RegExp(`^${this.prefix}-log-(\\d+)\\.bj$`);
-      const found = [];
-      for await (const [name] of this.dir.entries()) {
-        const m = name.match(logRe);
-        if (m) found.push({ gen: Number(m[1]), name });
-      }
-      return found.sort((a, b) => b.gen - a.gen).map((f) => f.name);
+      const listing = await this._listing();
+      return this._names(
+        (M, c) => withBytes(M, listing, (ptr, len) => M._sstw_log_candidates(c, ptr, len)),
+        'logCandidates'
+      );
     }
 
     /** Delete every entry-log file except `keepName` (call once the newly
      * compacted log is durable). Best-effort, like all sweeps here. */
     async pruneLogs(keepName) {
       this._ensureOpen();
-      for (const name of await this.logCandidates()) {
-        if (name !== keepName) await this._remove(name);
-      }
+      const listing = await this._listing();
+      const doomed = this._withStr(keepName ?? '', (M, k) => this._names(
+        (MM, c) => withBytes(MM, listing, (ptr, len) =>
+          MM._sstw_prune_logs_plan(c, ptr, len, k.ptr, k.len)),
+        'pruneLogs'
+      ));
+      for (const name of doomed) await this._remove(name);
     }
   }
 
@@ -2302,7 +2455,7 @@ export function bindStructures(runtime) {
   return {
     orderedKey, compositeKey, compositeUpperBound, BPlusTree,
     haversineDistance, RTree, TextLog, TiledTextLog, ENTRY_TYPE,
-    EntryLog, ENTRYLOG_TYPE, SnapshotStore, crc32, TextIndex,
+    EntryLog, ENTRYLOG_TYPE, SnapshotStore, crc32, snapshotCheckFiles, TextIndex,
     stemmer, createPatch, unifiedDiff, applyPatch, createDelta, applyDelta
   };
 }
