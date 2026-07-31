@@ -469,6 +469,21 @@ static int compute_bbox(rtree *t, rnode *nd) {
     return BJ_OK;
 }
 
+/* memcpy with a NULL source is undefined even when the length is zero --
+ * glibc declares both pointers nonnull, so UBSan reports it and the
+ * Linux fuzz job fails on the first hostile file that produces one. And
+ * a parsed node legitimately has NULL arrays with n == 0: an internal
+ * node whose "children" array is empty never allocates one (parse_node),
+ * which is exactly what a corrupt file can say.
+ *
+ * make_leaf and make_internal below already guard their copies with
+ * `if (n)`. Everything that copies a node's arrays goes through here
+ * instead, so the rule holds in one place rather than at each of the ten
+ * call sites that would otherwise have to remember it. */
+static void copy_n(void *dst, const void *src, size_t len) {
+    if (len) memcpy(dst, src, len);
+}
+
 static int make_leaf(rnode *out, uint64_t id, const rentry *entries, int n) {
     node_init(out);
     out->id = id; out->is_leaf = 1; out->n = n;
@@ -783,8 +798,8 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         if (is_leaf) {
             rentry *all = (rentry *)malloc((size_t)total * sizeof(rentry));
             if (!all) { e = BJ_ERR_OOM; goto done; }
-            memcpy(all, cr->node.entries, (size_t)cr->node.n * sizeof(rentry));
-            memcpy(all + cr->node.n, sib[s].entries, (size_t)sib[s].n * sizeof(rentry));
+            copy_n(all, cr->node.entries, (size_t)cr->node.n * sizeof(rentry));
+            copy_n(all + cr->node.n, sib[s].entries, (size_t)sib[s].n * sizeof(rentry));
             e = make_leaf(&nc1, cr->node.id, all, mid);
             if (!e) e = make_leaf(&nc2, sib[s].id, all + mid, total - mid);
             free(all);
@@ -792,10 +807,10 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
             uint64_t *all = (uint64_t *)malloc((size_t)total * sizeof(uint64_t));
             rbbox *allb = (rbbox *)malloc((size_t)total * sizeof(rbbox));
             if (!all || !allb) { free(all); free(allb); e = BJ_ERR_OOM; goto done; }
-            memcpy(all, cr->node.children, (size_t)cr->node.n * sizeof(uint64_t));
-            memcpy(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(uint64_t));
-            memcpy(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
-            memcpy(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
+            copy_n(all, cr->node.children, (size_t)cr->node.n * sizeof(uint64_t));
+            copy_n(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(uint64_t));
+            copy_n(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
+            copy_n(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
             e = make_internal(&nc1, cr->node.id, all, allb, mid);
             if (!e) e = make_internal(&nc2, sib[s].id, all + mid, allb + mid, total - mid);
             free(all); free(allb);
@@ -812,8 +827,8 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         uint64_t *newc = (uint64_t *)malloc((size_t)parent->n * sizeof(uint64_t));
         rbbox *newb = (rbbox *)malloc((size_t)parent->n * sizeof(rbbox));
         if (!newc || !newb) { free(newc); free(newb); e = BJ_ERR_OOM; goto done; }
-        memcpy(newc, parent->children, (size_t)parent->n * sizeof(uint64_t));
-        memcpy(newb, parent->child_bboxes, (size_t)parent->n * sizeof(rbbox));
+        copy_n(newc, parent->children, (size_t)parent->n * sizeof(uint64_t));
+        copy_n(newb, parent->child_bboxes, (size_t)parent->n * sizeof(rbbox));
         int lo = child_index < sib_idx[s] ? child_index : sib_idx[s];
         int hi = child_index < sib_idx[s] ? sib_idx[s] : child_index;
         newc[lo] = p1; newb[lo] = bb1;
@@ -833,18 +848,18 @@ static int handle_underflow(rtree *t, const rnode *parent, int child_index,
         if (is_leaf) {
             rentry *all = (rentry *)malloc((size_t)total * sizeof(rentry));
             if (!all) { e = BJ_ERR_OOM; goto done; }
-            memcpy(all, cr->node.entries, (size_t)cr->node.n * sizeof(rentry));
-            memcpy(all + cr->node.n, sib[s].entries, (size_t)sib[s].n * sizeof(rentry));
+            copy_n(all, cr->node.entries, (size_t)cr->node.n * sizeof(rentry));
+            copy_n(all + cr->node.n, sib[s].entries, (size_t)sib[s].n * sizeof(rentry));
             e = make_leaf(&m, t->next_id++, all, total);
             free(all);
         } else {
             uint64_t *all = (uint64_t *)malloc((size_t)total * sizeof(uint64_t));
             rbbox *allb = (rbbox *)malloc((size_t)total * sizeof(rbbox));
             if (!all || !allb) { free(all); free(allb); e = BJ_ERR_OOM; goto done; }
-            memcpy(all, cr->node.children, (size_t)cr->node.n * sizeof(uint64_t));
-            memcpy(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(uint64_t));
-            memcpy(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
-            memcpy(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
+            copy_n(all, cr->node.children, (size_t)cr->node.n * sizeof(uint64_t));
+            copy_n(all + cr->node.n, sib[s].children, (size_t)sib[s].n * sizeof(uint64_t));
+            copy_n(allb, cr->node.child_bboxes, (size_t)cr->node.n * sizeof(rbbox));
+            copy_n(allb + cr->node.n, sib[s].child_bboxes, (size_t)sib[s].n * sizeof(rbbox));
             e = make_internal(&m, t->next_id++, all, allb, total);
             free(all); free(allb);
         }
@@ -916,7 +931,7 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid,
     /* Internal node: find the child containing the entry. */
     uint64_t *updated = (uint64_t *)malloc((size_t)nd.n * sizeof(uint64_t));
     if (!updated) { node_free(&nd); return BJ_ERR_OOM; }
-    memcpy(updated, nd.children, (size_t)nd.n * sizeof(uint64_t));
+    copy_n(updated, nd.children, (size_t)nd.n * sizeof(uint64_t));
 
     for (int i = 0; i < nd.n; i++) {
         del_res cr;
@@ -936,7 +951,7 @@ static int remove_node(rtree *t, uint64_t ptr, const uint8_t *oid,
         if (e) { node_free(&cr.node); free(updated); node_free(&nd); return e; }
         rbbox *updated_b = (rbbox *)malloc((size_t)nd.n * sizeof(rbbox));
         if (!updated_b) { node_free(&cr.node); free(updated); node_free(&nd); return BJ_ERR_OOM; }
-        memcpy(updated_b, nd.child_bboxes, (size_t)nd.n * sizeof(rbbox));
+        copy_n(updated_b, nd.child_bboxes, (size_t)nd.n * sizeof(rbbox));
 
         uint64_t *newc = NULL; rbbox *newb = NULL; int newcount = 0, merged = 0;
         if (cr.underflow) {
