@@ -299,11 +299,16 @@ static int parse_node(bpt *t, uint64_t offset, bpt_node *out) {
     memcpy(out->buf, rec, rec_len);
     cur c = { out->buf, rec_len, 0 };
 
+    /* Every refusal below this point frees the buffer allocated above --
+     * except these three, which did not, and which are the ones a hostile
+     * file reaches FIRST: a record whose opening byte is not an object
+     * header never gets as far as the loop, where each return already
+     * calls node_free. 25 leaked buffers in a 20000-seed fuzz run. */
     uint8_t type;
-    if (take_type(&c, &type) || type != BJ_TYPE_OBJECT) return BJ_ERR_STATE;
+    if (take_type(&c, &type) || type != BJ_TYPE_OBJECT) { node_free(out); return BJ_ERR_STATE; }
     uint32_t size, count;
-    if (take_u32(&c, &size)) return BJ_ERR_EOF;
-    if (take_u32(&c, &count)) return BJ_ERR_EOF;
+    if (take_u32(&c, &size)) { node_free(out); return BJ_ERR_EOF; }
+    if (take_u32(&c, &count)) { node_free(out); return BJ_ERR_EOF; }
 
     for (uint32_t i = 0; i < count; i++) {
         uint32_t klen;
