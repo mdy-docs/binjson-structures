@@ -151,6 +151,35 @@ static int32_t pd_open(void *ctx, const char *name, uint32_t name_len,
     if (flags & BJ_NS_EXCL)   oflags |= O_EXCL;
     if (flags & BJ_NS_TRUNC)  oflags |= O_TRUNC;
 
+#ifdef __wasi__
+    /*
+     * Preview1 hands out rights at open time, and wasmtime's legacy
+     * preview1 implementation grants FD_WRITE only to an open that
+     * CREATES. A file opened O_RDWR without O_CREAT is readable and
+     * silently unwritable: every pwrite comes back EBADF. Node's host
+     * (uvwasi) grants write either way, and preview2 has no such rule --
+     * measured on all three, same bytes.
+     *
+     * That difference is invisible to a test suite that creates its
+     * files, which is every test here until a session opened a database
+     * somebody else wrote and could not write to it.
+     *
+     * So under WASI, ask for creation we know is a no-op -- but only
+     * after proving the file is there, because "open, must exist" is this
+     * call's contract (bjns.h) and a missing name must still be
+     * BJ_ERR_STATE rather than a new empty file. The probe costs one open
+     * on a path that is already doing one.
+     */
+    if (!(flags & BJ_NS_CREATE)) {
+        int probe;
+        do { probe = openat(((pdir *)ctx)->dirfd, path, O_RDONLY); }
+        while (probe < 0 && errno == EINTR);
+        if (probe < 0) return BJ_ERR_STATE;
+        close(probe);
+        oflags |= O_CREAT;
+    }
+#endif
+
     int fd;
     do { fd = openat(((pdir *)ctx)->dirfd, path, oflags, 0644); }
     while (fd < 0 && errno == EINTR);
