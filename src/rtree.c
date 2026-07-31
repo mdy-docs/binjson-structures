@@ -532,7 +532,16 @@ typedef struct {
  */
 static int split_node(rtree *t, const rnode *nd, ins_res *out) {
     int n = nd->n;
-    rbbox *cb = (rbbox *)malloc((size_t)n * sizeof(rbbox));
+    /* Two is the least that can become two. Callers only split what has
+     * overflowed a fanout of at least three, so this is unreachable --
+     * but the seed pair below indexes cb[0] and cb[1] unconditionally,
+     * and an empty node would have it reading a zero-byte allocation. */
+    if (n < 2) return BJ_ERR_STATE;
+    /* calloc, not malloc: the loop below fills every element, and gcc
+     * cannot see that through parse_node -- it warns on the seed pair.
+     * Zeroing a handful of boxes costs nothing next to the child reads
+     * this function is about to do. */
+    rbbox *cb = (rbbox *)calloc((size_t)n, sizeof(rbbox));
     int *grp = (int *)malloc((size_t)n * sizeof(int)); /* 1 or 2 */
     if (!cb || !grp) { free(cb); free(grp); return BJ_ERR_OOM; }
     int e = BJ_OK;

@@ -90,6 +90,16 @@ static int grow(uint8_t **buf, size_t *cap, size_t need) {
     return BJ_OK;
 }
 
+/* An adapter reports failure as a negative count (bjio.h), and every
+ * caller here narrows that to int. The narrowing is lossy in principle:
+ * a negative whose low 32 bits are zero would arrive as BJ_OK, and the
+ * caller would read a buffer nothing had filled. One line, in one place,
+ * so no read site has to remember. */
+static int io_read_err(int64_t got) {
+    int rc = (int)got;
+    return rc ? rc : BJ_ERR_STATE;
+}
+
 /* Append `n` bytes; `account_crc` controls whether they enter the running
  * commit CRC (trailer bytes must not — the trailer excludes itself). */
 static int append_bytes(bjfile *f, const uint8_t *b, size_t n, uint64_t *off,
@@ -174,7 +184,7 @@ int bjfile_read_record(bjfile *f, uint64_t off, const uint8_t **rec, size_t *rec
     int e = grow(&f->rd, &f->rd_cap, want);
     if (e) return e;
     int64_t got = f->io.read(f->io.ctx, off, f->rd, (uint32_t)want);
-    if (got < 0) return (int)got;
+    if (got < 0) return io_read_err(got);
 
     /* Size the record from its header (type byte + optional u32 size). */
     size_t sz;
@@ -189,7 +199,7 @@ int bjfile_read_record(bjfile *f, uint64_t off, const uint8_t **rec, size_t *rec
         if (e) return e;
         int64_t more = f->io.read(f->io.ctx, off + (uint64_t)got,
                                   f->rd + got, (uint32_t)(sz - (size_t)got));
-        if (more < 0) return (int)more;
+        if (more < 0) return io_read_err(more);
         if ((size_t)got + (size_t)more < sz) return BJ_ERR_EOF;
         if (sz > f->rd_hint) f->rd_hint = sz;
     }
@@ -203,6 +213,12 @@ int bjfile_read_record(bjfile *f, uint64_t off, const uint8_t **rec, size_t *rec
 
 /* Read exactly [off, off+n) into the read buffer (committed or pending). */
 static int read_range(bjfile *f, uint64_t off, size_t n, const uint8_t **p) {
+    /* Answered on every path, including the failing ones: a caller that
+     * checked the code and a caller that did not both see a pointer that
+     * was written by this function rather than whatever the stack held.
+     * gcc could not prove that either -- -Wmaybe-uninitialized on the
+     * trailer read in bjfile_check_tail is what asked the question. */
+    *p = NULL;
     uint64_t total = f->flen + f->wb_len;
     if (off > total || n > total - off) return BJ_ERR_EOF;
     if (off >= f->flen) {
@@ -213,7 +229,7 @@ static int read_range(bjfile *f, uint64_t off, size_t n, const uint8_t **p) {
     int e = grow(&f->rd, &f->rd_cap, n);
     if (e) return e;
     int64_t got = f->io.read(f->io.ctx, off, f->rd, (uint32_t)n);
-    if (got < 0) return (int)got;
+    if (got < 0) return io_read_err(got);
     if ((size_t)got < n) return BJ_ERR_EOF;
     *p = f->rd;
     return BJ_OK;
@@ -312,7 +328,7 @@ static int crc_over_range(bjfile *f, uint64_t from, uint64_t to,
     while (from < to) {
         size_t n = (to - from) < (uint64_t)cap ? (size_t)(to - from) : cap;
         int64_t got = f->io.read(f->io.ctx, from, buf, (uint32_t)n);
-        if (got < 0) return (int)got;
+        if (got < 0) return io_read_err(got);
         if ((size_t)got < n) return BJ_ERR_EOF;
         *crc = crc32_update(*crc, buf, n);
         from += n;
@@ -376,7 +392,7 @@ static int find_verified_commit(bjfile *f, uint64_t from, uint64_t flen) {
     while (pos < flen && !found) {
         size_t n = (flen - pos) < CH ? (size_t)(flen - pos) : CH;
         int64_t got = f->io.read(f->io.ctx, pos, buf, (uint32_t)n);
-        if (got < 0) { free(buf); return (int)got; }
+        if (got < 0) { free(buf); return io_read_err(got); }
         n = (size_t)got;
         if (n < BJFILE_TRAILER_SIZE) break;
         for (size_t i = 0; i + BJFILE_TRAILER_SIZE <= n && !found; i++) {
