@@ -149,13 +149,34 @@ static inline int take_string(cur *c, const uint8_t **p, uint32_t *len) {
 
 /* ---- Composite readers ------------------------------------------------ */
 
+/*
+ * Both of these bound the count they return against the bytes actually
+ * left, and that check is load-bearing rather than defensive.
+ *
+ * The count comes straight off the wire, and every caller's next move is
+ * to calloc that many elements: bplustree's keys and values, rtree's
+ * entries and childBBoxes, the text index's postings. A corrupt file
+ * that claims 0xF8000000 entries asks for 33 GB before a single byte of
+ * it is read -- which is not a hypothetical, it is what the hostile-file
+ * fuzzer produced, and what ASan's allocator aborted on (a Linux runner
+ * refuses the allocation; macOS overcommits it and limps on, which is
+ * why the same 20000 seeds passed there).
+ *
+ * No element can be shorter than the one byte of its own type tag, so a
+ * count larger than the remaining bytes is impossible rather than merely
+ * unlikely -- an object's fields cost at least five bytes each, so the
+ * same bound holds a fortiori. Refusing here means every caller is
+ * bounded by construction and none of them has to remember: one owner
+ * for the fact, at the point the fact is read.
+ */
 static inline int object_begin(cur *c, uint32_t *count) {
     uint8_t t;
     if (take_type(c, &t)) return BJ_ERR_EOF;
     if (t != BJ_TYPE_OBJECT) return BJ_ERR_UNKNOWN_TYPE;
     uint32_t size;
     if (take_u32(c, &size)) return BJ_ERR_EOF;
-    return take_u32(c, count);
+    if (take_u32(c, count)) return BJ_ERR_EOF;
+    return cur_need(c, *count);
 }
 static inline int array_begin(cur *c, uint32_t *count) {
     uint8_t t;
@@ -163,7 +184,8 @@ static inline int array_begin(cur *c, uint32_t *count) {
     if (t != BJ_TYPE_ARRAY) return BJ_ERR_UNKNOWN_TYPE;
     uint32_t size;
     if (take_u32(c, &size)) return BJ_ERR_EOF;
-    return take_u32(c, count);
+    if (take_u32(c, count)) return BJ_ERR_EOF;
+    return cur_need(c, *count);
 }
 /* An object field name (u32 length + bytes; points into the record). */
 static inline int take_key(cur *c, const uint8_t **kn, uint32_t *klen) {
