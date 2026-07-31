@@ -176,6 +176,27 @@ static int32_t pd_sync(void *ctx) {
         /* Some filesystems refuse to fsync a directory; best-effort, the
          * same stance src/db-node.js's _fsyncDir takes. */
         if (errno == EINVAL || errno == ENOTSUP) return BJ_OK;
+#ifdef __wasi__
+        /* And under WASI the refusal is the host's, not the filesystem's.
+         * Preview1 is rights-based: fd_sync needs RIGHT_FD_SYNC, which a
+         * preopened DIRECTORY is not granted, so the call cannot even
+         * reach the filesystem. wasmtime answers BADF; another host may
+         * answer NOTCAPABLE, preview1's own spelling for a missing right.
+         * Node's host forwards fsync to the real descriptor and succeeds,
+         * which is why this went unnoticed -- it is the only WASI host
+         * this library was ever run under.
+         *
+         * Tolerated HERE and only here. On a real POSIX system EBADF from
+         * fsync means a closed or invalid descriptor, and answering BJ_OK
+         * to that would report a durability step as done when the fd was
+         * never valid to begin with -- a bug hidden, not handled. Under
+         * WASI it means the capability does not exist, which is exactly
+         * what the EINVAL/ENOTSUP arm above already exists to survive. */
+        if (errno == EBADF) return BJ_OK;
+#ifdef ENOTCAPABLE
+        if (errno == ENOTCAPABLE) return BJ_OK;
+#endif
+#endif
         return BJ_ERR_STATE;
     }
     return BJ_OK;

@@ -95,6 +95,13 @@ typedef struct bj_ns {
      * notion). Without it, a crash can lose a freshly created file's
      * directory entry even though the file's own bytes were fsynced;
      * src/db-node.js already does this and documents why.
+     *
+     * BEST-EFFORT, and BJ_OK does not mean a sync happened: a platform
+     * that refuses to sync a directory (some filesystems answer EINVAL;
+     * a WASI host need not grant fd_sync on a preopened directory at all)
+     * reports success, because an adapter cannot make a promise its host
+     * will not keep and every caller would have to ignore the refusal
+     * anyway. An error means a sync that COULD have happened did not.
      */
     int32_t (*sync)(void *ctx);
 } bj_ns;
