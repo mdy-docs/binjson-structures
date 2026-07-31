@@ -11,6 +11,18 @@
  * build-common.sh exclusion list), which keeps hostio.c's OPFS bridge as
  * the browser's adapter.
  */
+/* Ask for POSIX.1-2008 before any header is read. Consumers compile this
+ * with -std=c11 rather than -std=gnu11, which defines __STRICT_ANSI__,
+ * and glibc answers that by hiding everything this file is made of:
+ * pread, pwrite, ftruncate, fdatasync, openat and unlinkat all become
+ * implicit declarations and the build dies on -Werror. Darwin and
+ * wasi-libc declare them regardless, which is why a macOS developer and
+ * the WASI target never saw it and a Linux CI runner never saw anything
+ * else. 200809L is the level that covers all six. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "bjio_posix.h"
 
 #include <errno.h>
