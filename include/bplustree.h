@@ -251,6 +251,17 @@ int bpt_cursor_next_batch(bpt_cursor *c, size_t max_bytes, int *count,
                           const uint8_t **out_ptr, size_t *out_len);
 /* Release a cursor (never touches the file). Safe to pass NULL. */
 void bpt_cursor_close(bpt_cursor *c);
+/*
+ * How many cursors are currently open over `t`.
+ *
+ * The snapshot a cursor gets is free only while the nodes it pinned are
+ * still in the file. Mutations never overwrite them -- but anything that
+ * REWRITES the file (a compaction that rebuilds the tree into fresh
+ * storage and drops the old) leaves every open cursor pointing at bytes
+ * that are no longer there. That is not this file's decision to make, so
+ * this reports the fact and the file's owner refuses on it.
+ */
+int bpt_pinned(const bpt *t);
 
 #ifdef __cplusplus
 }

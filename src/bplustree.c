@@ -82,6 +82,7 @@ struct bpt {
     int        order;
     int        min_keys;
     int        read_only;      /* snapshot handle: mutations disabled */
+    int        cursors;        /* live cursors positioned in this tree */
     uint64_t   applied_index;  /* last log index applied to this tree; 0 =
                                   not log-driven. Staged by the setter and
                                   persisted with every metadata write.     */
@@ -1159,8 +1160,17 @@ bpt_cursor *bpt_cursor_open(bpt *t, const bpt_key *min, const bpt_key *max) {
     /* Pin the current root: the cursor iterates this snapshot regardless of
      * later mutations (append-only nodes are never overwritten). */
     if (cursor_descend(c, t->root, 1)) { bpt_cursor_close(c); return NULL; }
+    /* And say so on the TREE. Append-only is what makes the snapshot free,
+     * but it is only free while the old nodes are still there -- anything
+     * that rewrites the file (compaction) invalidates every cursor open
+     * against it, and the only way to refuse that safely is for the tree
+     * to know it has readers. bpt_pinned() is that answer; nothing here
+     * enforces it, because the file's owner is the one who can. */
+    t->cursors++;
     return c;
 }
+
+int bpt_pinned(const bpt *t) { return t ? t->cursors : 0; }
 
 static void cursor_release(bpt_cursor *c) {
     if (c->has_leaf) { node_free(&c->leaf); c->has_leaf = 0; }
@@ -1241,6 +1251,7 @@ int bpt_cursor_next_batch(bpt_cursor *c, size_t max_bytes, int *count,
 
 void bpt_cursor_close(bpt_cursor *c) {
     if (!c) return;
+    if (c->t && c->t->cursors > 0) c->t->cursors--;
     cursor_release(c);
     if (c->has_min) key_free(&c->min);
     if (c->has_max) key_free(&c->max);
