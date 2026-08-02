@@ -91,15 +91,29 @@ typedef struct { int scope; } bridge_ns;
 
 static int32_t bns_open(void *ctx, const char *name, uint32_t name_len,
                         uint32_t flags, bj_io *out) {
-    /* Flags are the host's business here: it already created, truncated
-     * or exclusively opened the file when the plan told it to. Honoring
-     * them again would mean re-opening, which is the thing this adapter
-     * cannot do. */
-    (void)flags;
     if (name_len > 0x7fffffffu) return BJ_ERR_RANGE;
     int fd = bjns_js_lookup(((bridge_ns *)ctx)->scope, name, (int)name_len);
     if (fd < 0) return BJ_ERR_STATE;   /* undeclared name: a plan/execute bug */
     *out = bjio_host(fd);
+
+    /*
+     * CREATE and EXCL are the host's and cannot be anything else: they
+     * are decisions about a file that does not have a handle yet, and by
+     * the time this runs it does. TRUNC is different -- it is a thing you
+     * can do TO an open handle, and bj_io has the verb for it.
+     *
+     * So it is honored here rather than left to the host, because the
+     * plan the host opened from is a list of NAMES: it says which files
+     * a call will touch, not how each one must be opened. A host cannot
+     * apply a flag it was never told. Left undone, an existing file
+     * opened for overwrite keeps whatever tail the new contents do not
+     * reach -- which is a restored snapshot file with the old database's
+     * records still in it.
+     */
+    if ((flags & BJ_NS_TRUNC) && out->truncate) {
+        int32_t e = out->truncate(out->ctx, 0);
+        if (e) return e;
+    }
     return BJ_OK;
 }
 

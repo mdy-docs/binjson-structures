@@ -1972,6 +1972,19 @@ export function bindStructures(runtime) {
       return requireModule()._sstw_store(this._ctx);
     }
 
+    /**
+     * Re-read `latest` from the C store. Needed when something ELSE in
+     * this module committed a generation through the same `sst` -- a Raft
+     * node receiving a snapshot install does exactly that, which is what
+     * storeCtx exists for. Without it this side would go on describing
+     * the generation that was live before the install.
+     */
+    refresh() {
+      this._ensureOpen();
+      this._latest = this._readLatest();
+      return this._latest;
+    }
+
     _ensureOpen() {
       if (!this.isOpen) throw new Error('SnapshotStore is not open');
     }
@@ -2148,6 +2161,15 @@ export function bindStructures(runtime) {
       if (!this._latest) throw new Error('No snapshot to pair a log with');
       const name = this._logName(this._latest.gen);
       return { name, handle: await this._sync(name, true) };
+    }
+
+    /** The log filename paired with the adopted generation, or null.
+     * What pruneLogs must be told to KEEP -- which a host that did not
+     * create the log itself has no other way to name (a Raft node
+     * rebasing its own log through a bj_ns is the case). */
+    get logName() {
+      this._ensureOpen();
+      return this._latest ? this._logName(this._latest.gen) : null;
     }
 
     /** Existing entry-log files, newest generation first. Try each with
