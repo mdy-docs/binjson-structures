@@ -140,6 +140,7 @@ _sstw_new
 _sstw_free
 _sstw_out_ptr
 _sstw_out_len
+_sstw_store
 _sstw_manifest_name
 _sstw_data_name
 _sstw_log_name

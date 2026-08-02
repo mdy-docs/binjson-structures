@@ -1379,6 +1379,29 @@ export function bindStructures(runtime) {
       this.isOpen = false;
       this.ctx = 0;
       this._fd = 0;
+      this._ownsCtx = true;
+    }
+
+    /**
+     * Wrap a log some other C component in this module opened and OWNS.
+     * There is one: raft_node.h's rn_adopt rebases a node's log onto a
+     * snapshot boundary through a bj_ns, entirely inside C, and hands
+     * back only the pointer -- so a host that needs to READ that log
+     * (terms, batches, the hard state) has no constructor to reach it
+     * with.
+     *
+     * `ctx` is BORROWED and outlives this wrapper: close() releases the
+     * file handle and the fd, which are the host's, and leaves the elog
+     * to whoever created it. Closing it here instead would free a log the
+     * node is still using, and the node frees it again at rn_free.
+     */
+    static adopting(ctx, syncHandle, fd) {
+      const log = new EntryLog(syncHandle);
+      log.ctx = ctx;
+      log._fd = fd;
+      log._ownsCtx = false;
+      log.isOpen = true;
+      return log;
     }
 
     /**
@@ -1427,7 +1450,7 @@ export function bindStructures(runtime) {
         await this.syncAccessHandle.close();
       }
       if (this.ctx) {
-        requireModule()._elw_free(this.ctx);
+        if (this._ownsCtx) requireModule()._elw_free(this.ctx);
         this.ctx = 0;
       }
       unregisterHandle(requireModule(), this._fd);
@@ -1930,6 +1953,23 @@ export function bindStructures(runtime) {
      * config, files: [{ role, name, size, crc }] }, or null if none. */
     get latest() {
       return this._latest;
+    }
+
+    /**
+     * The C store behind this one (snapstore.h's `sst`), for another C
+     * component in the same module that takes one -- a Raft node serving
+     * and receiving snapshot installs is the reason it is reachable
+     * (raft_node.h's rn_set_snapstore).
+     *
+     * BORROWED, and deliberately this store rather than a second one over
+     * the same prefix: `latest` moves when an install commits, and two
+     * stores scanning one directory would be two answers to "which
+     * generation is live". Whoever borrows it must be finished before
+     * close(). Public for the same reason EntryLog.ctx is.
+     */
+    get storeCtx() {
+      this._ensureOpen();
+      return requireModule()._sstw_store(this._ctx);
     }
 
     _ensureOpen() {

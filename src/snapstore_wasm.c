@@ -43,6 +43,19 @@ EMSCRIPTEN_KEEPALIVE void sstw_free(sstw *w) {
 EMSCRIPTEN_KEEPALIVE const uint8_t *sstw_out_ptr(sstw *w) { return w->out.data; }
 EMSCRIPTEN_KEEPALIVE int sstw_out_len(sstw *w) { return (int)w->out.len; }
 
+/*
+ * The store itself, for another C component in the same module that
+ * takes an `sst *` -- a Raft node serving and receiving snapshot
+ * installs is the one that exists (raft_node.h's rn_set_snapstore).
+ *
+ * BORROWED, and deliberately the same store rather than a second one
+ * over the same prefix: `latest` moves when an install commits, and two
+ * stores scanning one directory would be two answers to "which
+ * generation is live". The host still owns it; sstw_free still ends it,
+ * and anything holding this pointer must be done first.
+ */
+EMSCRIPTEN_KEEPALIVE sst *sstw_store(sstw *w) { return w ? w->s : NULL; }
+
 /* ---- names ------------------------------------------------------------- */
 
 EMSCRIPTEN_KEEPALIVE int sstw_manifest_name(sstw *w, double gen) {
