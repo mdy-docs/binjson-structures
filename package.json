@@ -4,7 +4,8 @@
   "description": "WASM/C B+ tree, R-tree, text log, and text index data structures, built on the binjson wire format and file model",
   "type": "module",
   "exports": {
-    "./wasm": "./wasm/binjson-structures-wasm.js"
+    "./wasm": "./wasm/binjson-structures-wasm.js",
+    "./providers": "./wasm/providers.js"
   },
   "files": [
     "wasm",
